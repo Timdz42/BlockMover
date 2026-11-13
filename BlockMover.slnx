@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="BlockMover/BlockMover.vcxproj" Id="5b91d65d-485f-4583-b5c8-ed4a508f78b8" />
+</Solution>
