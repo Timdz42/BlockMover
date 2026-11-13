@@ -1,4 +1,20 @@
-# TMNF BlockMover Studio
+<div align="center">
+
+# 🏎️ TMNF BlockMover Studio
+
+**Real-Time 3D Track Editor & Blueprint Suite for TrackMania Nations Forever**
+
+[![Release](https://img.shields.io/badge/Release-v1.0.0-00e5ff?style=for-the-badge)](../../releases)
+[![Platform](https://img.shields.io/badge/Platform-Win32%20(x86)-0078d7?style=for-the-badge&logo=windows)](#)
+[![DirectX](https://img.shields.io/badge/DirectX-9.0c-107c10?style=for-the-badge)](#)
+[![Loader](https://img.shields.io/badge/TMLoader-Modded%20Forever%202.13-ff9800?style=for-the-badge)](#)
+[![Compatibility](https://img.shields.io/badge/TMUnlimiter-2.0.2-9c27b0?style=for-the-badge)](#)
+
+</div>
+
+---
+
+## 📖 Overview
 
 **BlockMover Studio** is a native C++ / Direct3D 9 DLL modification (`BlockMover.dll`) for the **TrackMania Nations Forever** track editor (`TmForever.exe`), built for **TMLoader / Modded Forever (2.13.0)** with **TMUnlimiter (2.0.2)** and **CoreMod**.
 
@@ -24,14 +40,35 @@ It enables real-time 3D block manipulation, camera-relative movement, smart mult
 
 ---
 
-## 🚀 Installation
+## 🚀 Installation Guide (TMLoader & BlockMover)
 
-1. Download `BlockMover.dll` from the **Releases** page (or compile it from source as `Release | x86`).
-2. Place `BlockMover.dll` into your TrackMania Nations Forever directory / load it via **TMLoader** (Modded Forever).
-3. Launch the game, open a map in the **Track Editor**, and press **`F3`** to open or close the BlockMover Studio overlay.
+### Step 1: Install TMLoader (if not already installed)
+1. Visit the official **TMLoader** website: [**https://tomashu.dev/software/tmloader/**](https://tomashu.dev/software/tmloader/)
+2. Download the latest **TMLoader** release and extract it to a folder of your choice (or into your TrackMania Nations Forever installation directory).
+3. Run **`TMLoader.exe`** once so it initializes its local database folders and downloads the base mods (**Modded Forever / CoreMod** and **TMUnlimiter**).
+
+### Step 2: Install BlockMover Studio
+1. Download **`BlockMover.zip`** from the [**Releases**](../../releases) page of this repository.
+2. Press **`Win + R`** on your keyboard, paste the following path, and hit **Enter**:
+   ```text
+   %localappdata%\TMLoader\database\TmForever\products
+   ```
+3. Extract **`BlockMover.zip`** into this folder so that the `BlockMover` directory sits directly inside `products`:
+   ```text
+   ...\TMLoader\database\TmForever\products\BlockMover\1.0.0\BlockMover.dll
+   ...\TMLoader\database\TmForever\products\BlockMover\1.0.0\description.yaml
+   ```
+
+### Step 3: Activate Mods in TMLoader (`◆` Diamond Icons)
+1. Launch **`TMLoader.exe`** and select or edit your game profile.
+2. In the mod list, make sure you enable **all three** of the following mods by clicking the **diamond icon** next to them:
+   * **`◆` CoreMod** *(Modded Forever)*
+   * **`◆` TMUnlimiter** *(2.0.2)*
+   * **`◆` BlockMover** *(1.0.0)*
+   > 💡 **Important:** A mod is only active when its diamond icon is **filled (`◆`)**. If the diamond is **hollow (`◇`)**, the mod is disabled—click the diamond once so it becomes filled!
+3. Launch the game via **TMLoader**, open any map in the **Track Editor**, and press **`F3`** to open or close the BlockMover Studio overlay.
 
 ---
-
 ## 🎮 Default Controls
 
 | Action | Preset 1 (Default) | Preset 2 (Numpad) |
@@ -50,6 +87,24 @@ It enables real-time 3D block manipulation, camera-relative movement, smart mult
 | **Spawn Blueprint at Cursor** | `I` or `Ctrl + V` | `Ctrl + V` |
 
 *All 22 hotkeys can be customized or cleared with `DEL` in Tab 4 of the `F3` menu and are automatically saved in `BlockMover.ini`.*
+
+---
+
+## 📸 Screenshots & Preview
+
+| Live 3D Selection & Controls (`Tab 1`) | Blueprint Air-Spawner (`Tab 2`) |
+| :---: | :---: |
+| ![Studio UI Preview](https://github.com/user-attachments/assets/39a0da8d-5412-4835-896b-ccfa725a742b) | ![Blueprints Preview](https://github.com/user-attachments/assets/60be524b-4476-49c6-a387-d7429b438bb0) |
+
+---
+
+### 2. Live 3D Selection & Controls (`Tab 1`)
+
+https://github.com/user-attachments/assets/eb93dc89-faf7-4a84-9729-8b45b5ba6e3a
+
+### Blueprint Air-Spawner (`Tab 2`)
+
+https://github.com/user-attachments/assets/fd67257d-3ca7-4d5c-8d81-f0f615851fc8
 
 ---
 
