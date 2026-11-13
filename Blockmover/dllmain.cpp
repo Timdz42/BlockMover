@@ -41,15 +41,16 @@ static uintptr_t g_exeEnd = 0;
 constexpr uintptr_t RVA_APP_SINGLETON_1 = 0x00968C44;
 constexpr uintptr_t RVA_APP_SINGLETON_2 = 0x00972EB8;
 
-constexpr int BLOCK_OFF_BLOCKINFO = 0x24;
-constexpr int BLOCK_OFF_MOBIL_1 = 0x30;
+constexpr int BLOCK_OFF_SKIN = 0x20; // CGameCtnBlockSkin* (Schilder / Custom-Links)
+constexpr int BLOCK_OFF_BLOCKINFO = 0x24; // CGameCtnBlockInfo*
+constexpr int BLOCK_OFF_MOBIL_1 = 0x30; // CSceneMobil*
 constexpr int BLOCK_OFF_NOD_40 = 0x40;
 constexpr int BLOCK_OFF_MOBIL_2 = 0x44;
 constexpr int BLOCK_OFF_COORD_X = 0x48;
 constexpr int BLOCK_OFF_COORD_Y = 0x4C;
 constexpr int BLOCK_OFF_COORD_Z = 0x50;
 constexpr int BLOCK_OFF_DIR = 0x54; // 0 = North, 1 = East, 2 = South, 3 = West
-constexpr int BLOCK_OFF_FLAGS60 = 0x60; // 0x1000 = Terrain/Flat, 0x2000 = Clip, 0 = Normal
+constexpr int BLOCK_OFF_FLAGS60 = 0x60; // Bits 0..5 = Variant, 0x1000 = IsGround, 0x2000 = Clip, 0x8000 = HasSkin
 
 static CRITICAL_SECTION g_stateCs;
 static bool             g_csInitialized = false;
@@ -240,7 +241,7 @@ static ModState g_state = ModState::Selecting;
 struct ModConfig {
     bool modEnabled = true;
     int  language = 1; // 1 = English, 0 = Deutsch
-    int  ruleMode = static_cast<int>(BuildRuleMode::Vanilla);
+    int  ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
     bool cameraRelativeMove = true;
     bool cursorFollowsMove = true;
     bool rotateAsGroup = true;
@@ -250,7 +251,7 @@ struct ModConfig {
     bool onlyPlayerBlocks = true;
     int  stepMultiplier = 1;
 
-    // Standard-Keybinds (entsprechend deiner BlockMover.ini)
+    // Standard-Keybinds
     int keyToggleMenu = VK_F3;      // 114
     int keyToggleModMode = VK_F6;      // 117
     int keySelectBlock = 'E';        // 69
@@ -393,27 +394,54 @@ static void GetBlockSceneMobils(uintptr_t blockAddr, std::vector<uintptr_t>& out
     }
 }
 
+static bool IsStadiumPerimeterBlockInfo(uintptr_t blockInfo) {
+    if (!IsAnyHeapObject(blockInfo)) return false;
+    for (int off = 0x14; off <= 0x40; off += 4) {
+        uint32_t strPtr = 0;
+        if (SafeReadU32(blockInfo + off, &strPtr) && strPtr >= 0x10000) {
+            __try {
+                const char* s = reinterpret_cast<const char*>(strPtr);
+                if (s[0] >= 'A' && s[0] <= 'Z') {
+                    if (std::strncmp(s, "Stadium", 7) == 0 &&
+                        (std::strstr(s, "Warp") != nullptr || std::strstr(s, "Tribune") != nullptr ||
+                            std::strstr(s, "Sculpt") != nullptr || std::strstr(s, "Screen") != nullptr ||
+                            std::strstr(s, "Light") != nullptr)) {
+                        return true;
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    return false;
+}
+
 static bool IsMovableTrackBlock(uintptr_t blockAddr) {
     if (!IsAnyHeapObject(blockAddr)) return false;
 
     uint32_t blockInfo = 0;
     if (SafeReadU32(blockAddr + BLOCK_OFF_BLOCKINFO, &blockInfo) && IsAnyHeapObject(blockInfo)) {
         const char* biName = GetHeapObjectClassName(blockInfo);
-        if (biName && (ClassContainsWord(biName, "BlockInfoClip") || ClassContainsWord(biName, "BlockInfoFlat"))) {
+        // Nur reine Gras-Bodenkacheln (Flat), Auto-Clips und Stützpfeiler ausschließen:
+        if (biName && (ClassContainsWord(biName, "BlockInfoClip") ||
+            ClassContainsWord(biName, "BlockInfoFlat") ||
+            ClassContainsWord(biName, "BlockInfoPylon"))) {
             return false;
         }
     }
 
     uint32_t flags60 = 0;
     if (SafeReadU32(blockAddr + BLOCK_OFF_FLAGS60, &flags60)) {
-        if ((flags60 & 0x2000u) != 0 || (flags60 & 0x3Fu) == 0x3Fu) return false;
+        // WICHTIG: 0x1000 NICHT ausschließen! 0x1000 = IsGround (normale Blöcke, die auf dem Boden stehen).
+        // Nur 0x2000 (Auto-Clip), 0x3F (System-Variante) und 0x10000000/0x20000000 (feste Stadion-Umgebung) ausschließen:
+        if ((flags60 & 0x2000u) != 0 || (flags60 & 0x3Fu) == 0x3Fu || (flags60 & 0x30000000u) != 0) {
+            return false;
+        }
     }
 
     if (g_cfg.onlyPlayerBlocks && !IsBlockSelected(blockAddr)) {
         Int3 c = ReadBlockCoord(blockAddr);
-        bool isStadiumPerimeter = (c.x >= 0 && c.x <= 31 && c.z >= 0 && c.z <= 31 && c.y <= 8) &&
-            (c.x <= 2 || c.x >= 29 || c.z <= 2 || c.z >= 29);
-        if (isStadiumPerimeter) return false;
+        if (c.y <= 0 || IsStadiumPerimeterBlockInfo(blockInfo)) return false;
     }
 
     std::vector<uintptr_t> mobils;
@@ -575,11 +603,99 @@ struct SceneMobilPlacement {
     uint32_t pZoneOverride;
 };
 
+static uintptr_t ReadBlockPlugTree(uintptr_t blockAddr) {
+    uint32_t mob = 0, hmsItem = 0, plugSolid = 0, plugTree = 0;
+    if (SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &mob) && IsAnyHeapObject(mob) &&
+        SafeReadU32(mob + 0x28, &hmsItem) && IsAnyHeapObject(hmsItem) &&
+        SafeReadU32(hmsItem + 0x14, &plugSolid) && IsAnyHeapObject(plugSolid) &&
+        SafeReadU32(plugSolid + 0x5C, &plugTree) && IsAnyHeapObject(plugTree)) {
+        return plugTree;
+    }
+    return 0;
+}
+
+static uint32_t ReadBlockCorpus4C(uintptr_t blockAddr) {
+    uint32_t mob = 0, hmsItem = 0, cCnt = 0, cArr = 0, corp0 = 0, val4C = 0;
+    if (SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &mob) && IsAnyHeapObject(mob) &&
+        SafeReadU32(mob + 0x28, &hmsItem) && IsAnyHeapObject(hmsItem) &&
+        SafeReadU32(hmsItem + 0x34, &cCnt) && SafeReadU32(hmsItem + 0x38, &cArr) &&
+        cCnt > 0 && IsSafeWritableHeapAddr(cArr) &&
+        SafeReadU32(cArr, &corp0) && IsAnyHeapObject(corp0) &&
+        SafeReadU32(corp0 + 0x4C, &val4C)) {
+        return val4C;
+    }
+    return 0;
+}
+
 struct PendingBlockSpawn {
     uintptr_t pBlockInfo;
     Int3      pos;
     uint32_t  dir;
+    uint32_t  flags60;
+    uintptr_t pSkin;
+    uintptr_t pPlugTree;
 };
+
+struct ClonedSignVisualOverride {
+    uintptr_t blockAddr;
+    uintptr_t pSkin;
+    uintptr_t pPlugTree;
+    uint32_t  corpus4C;
+    uint32_t  flags60;
+};
+
+static std::vector<ClonedSignVisualOverride> g_clonedSignOverrides;
+
+static void ApplyClonedSignVisualOverrideToBlock(const ClonedSignVisualOverride& ov) {
+    if (!IsAnyHeapObject(ov.blockAddr)) return;
+
+    // 1. Flags60 (inkl. 0x8000 Skin-Bit) sicherstellen
+    if (ov.flags60 != 0u) {
+        uint32_t curFl60 = 0;
+        if (SafeReadU32(ov.blockAddr + BLOCK_OFF_FLAGS60, &curFl60)) {
+            SafeWriteU32(ov.blockAddr + BLOCK_OFF_FLAGS60, (curFl60 & ~0x8FFFu) | (ov.flags60 & 0x8FFFu));
+        }
+    }
+
+    // 2. Exakten CGameCtnBlockSkin (+0x20) des Quell-Schildes setzen
+    if (IsAnyHeapObject(ov.pSkin)) {
+        uint32_t curSkin = 0;
+        if (SafeReadU32(ov.blockAddr + BLOCK_OFF_SKIN, &curSkin) && curSkin != ov.pSkin) {
+            uint32_t refCnt = 0;
+            if (SafeReadU32(ov.pSkin + 0x04, &refCnt)) {
+                SafeWriteU32(ov.pSkin + 0x04, refCnt + 1);
+            }
+            SafeWriteU32(ov.blockAddr + BLOCK_OFF_SKIN, static_cast<uint32_t>(ov.pSkin));
+        }
+    }
+
+    // 3. CPlugTree (CPlugSolid + 0x5C) UND gecachten Render-Pointer (CHmsCorpus + 0x4C) aktualisieren
+    uint32_t dstMob = 0, dstHmsItem = 0, dstPlugSolid = 0;
+    if (SafeReadU32(ov.blockAddr + BLOCK_OFF_MOBIL_1, &dstMob) && IsAnyHeapObject(dstMob) &&
+        SafeReadU32(dstMob + 0x28, &dstHmsItem) && IsAnyHeapObject(dstHmsItem)) {
+
+        if (IsAnyHeapObject(ov.pPlugTree) &&
+            SafeReadU32(dstHmsItem + 0x14, &dstPlugSolid) && IsAnyHeapObject(dstPlugSolid)) {
+            uint32_t oldTree = 0;
+            if (SafeReadU32(dstPlugSolid + 0x5C, &oldTree) && oldTree != ov.pPlugTree) {
+                uint32_t treeRef = 0;
+                if (SafeReadU32(ov.pPlugTree + 0x04, &treeRef)) {
+                    SafeWriteU32(ov.pPlugTree + 0x04, treeRef + 1);
+                }
+                SafeWriteU32(dstPlugSolid + 0x5C, static_cast<uint32_t>(ov.pPlugTree));
+            }
+        }
+
+        if (ov.corpus4C != 0) {
+            uint32_t cCnt = 0, cArr = 0, corp0 = 0;
+            if (SafeReadU32(dstHmsItem + 0x34, &cCnt) && SafeReadU32(dstHmsItem + 0x38, &cArr) &&
+                cCnt > 0 && IsSafeWritableHeapAddr(cArr) &&
+                SafeReadU32(cArr, &corp0) && IsAnyHeapObject(corp0)) {
+                SafeWriteU32(corp0 + 0x4C, ov.corpus4C);
+            }
+        }
+    }
+}
 
 static bool                           g_menuVisible = false;
 static WNDPROC                        g_origGameWndProc = nullptr;
@@ -866,7 +982,32 @@ static void ExecuteEditorSceneRebuildNow() {
                         RefreshEditorContext();
                         uint32_t countBefore = g_ctx.blockCount;
 
+                        uint32_t varArg = sp.flags60 & 0x3Fu;
                         uintptr_t res = 0;
+
+                        if (sp.pos.y >= 2) {
+                            res = CallEditorPlaceBlockVt68Seh(
+                                g_ctx.pEditorCat, fnVt68, sp.pBlockInfo,
+                                sp.pos.x, sp.pos.y, sp.pos.z, sp.dir & 3u, varArg);
+                            if (!res && varArg != 0u) {
+                                res = CallEditorPlaceBlockVt68Seh(
+                                    g_ctx.pEditorCat, fnVt68, sp.pBlockInfo,
+                                    sp.pos.x, sp.pos.y, sp.pos.z, sp.dir & 3u, 0u);
+                            }
+                        }
+
+                        if (!res) {
+                            int32_t airY = MaxI32(sp.pos.y + 1, 2);
+                            res = CallEditorPlaceBlockVt68Seh(
+                                g_ctx.pEditorCat, fnVt68, sp.pBlockInfo,
+                                sp.pos.x, airY, sp.pos.z, sp.dir & 3u, varArg);
+                            if (!res && varArg != 0u) {
+                                res = CallEditorPlaceBlockVt68Seh(
+                                    g_ctx.pEditorCat, fnVt68, sp.pBlockInfo,
+                                    sp.pos.x, airY, sp.pos.z, sp.dir & 3u, 0u);
+                            }
+                        }
+
                         static uint32_t s_spawnSlotCounter = 0;
                         for (int attempt = 0; attempt < 24 && !res; ++attempt) {
                             uint32_t slot = (s_spawnSlotCounter++) % 812u;
@@ -875,13 +1016,7 @@ static void ExecuteEditorSceneRebuildNow() {
                             int32_t tempY = 28 - static_cast<int32_t>((slot / 58u) % 14u);
                             res = CallEditorPlaceBlockVt68Seh(
                                 g_ctx.pEditorCat, fnVt68, sp.pBlockInfo,
-                                tempX, tempY, tempZ, sp.dir & 3u, 0u);
-                        }
-
-                        if (!res) {
-                            res = CallEditorPlaceBlockVt68Seh(
-                                g_ctx.pEditorCat, fnVt68, sp.pBlockInfo,
-                                sp.pos.x, MaxI32(sp.pos.y, 2), sp.pos.z, sp.dir & 3u, 0u);
+                                tempX, tempY, tempZ, sp.dir & 3u, varArg);
                         }
 
                         if (res && RefreshEditorContext() && g_ctx.blockCount > countBefore) {
@@ -899,9 +1034,39 @@ static void ExecuteEditorSceneRebuildNow() {
 
                                 WriteBlockCoord(newBlk, sp.pos);
                                 WriteBlockDir(newBlk, sp.dir & 3u);
+
+                                // Falls das Quell-Schild einen Skin hatte, Override-Eintrag anlegen
+                                if (IsAnyHeapObject(sp.pSkin) || IsAnyHeapObject(sp.pPlugTree)) {
+                                    uint32_t srcCorpus4C = 0;
+                                    for (uint32_t bIdx = 0; bIdx < countBefore; ++bIdx) {
+                                        uint32_t candB = 0, candSkin = 0;
+                                        if (SafeReadU32(g_ctx.pBlocksArray + bIdx * 4, &candB) && candB != newBlk &&
+                                            SafeReadU32(candB + BLOCK_OFF_SKIN, &candSkin) && candSkin == sp.pSkin) {
+                                            srcCorpus4C = ReadBlockCorpus4C(candB);
+                                            break;
+                                        }
+                                    }
+                                    ClonedSignVisualOverride ov = { newBlk, sp.pSkin, sp.pPlugTree, srcCorpus4C, sp.flags60 };
+                                    g_clonedSignOverrides.push_back(ov);
+                                    ApplyClonedSignVisualOverrideToBlock(ov);
+                                }
+                                else {
+                                    if (sp.flags60 != 0u) {
+                                        uint32_t curFl60 = 0;
+                                        SafeReadU32(newBlk + BLOCK_OFF_FLAGS60, &curFl60);
+                                        SafeWriteU32(newBlk + BLOCK_OFF_FLAGS60, (curFl60 & ~0x8FFFu) | (sp.flags60 & 0x8FFFu));
+                                    }
+                                    uint32_t unwantedSkin = 0;
+                                    if (SafeReadU32(newBlk + BLOCK_OFF_SKIN, &unwantedSkin) && unwantedSkin != 0) {
+                                        SafeWriteU32(newBlk + BLOCK_OFF_SKIN, 0);
+                                    }
+                                }
+
                                 if (std::fabs(dxW) > 0.01f || std::fabs(dyW) > 0.01f || std::fabs(dzW) > 0.01f) {
                                     MoveBlockVisualsTargeted(newBlk, dxW, dyW, dzW);
                                 }
+                                RotateBlockVisualsTargeted(newBlk, sp.dir & 3u);
+
                                 MarkBlockDirty(newBlk);
                                 g_selectedBlocks.push_back({ newBlk, 0.0f });
                                 ++spawned;
@@ -943,6 +1108,11 @@ static void ExecuteEditorSceneRebuildNow() {
             uint32_t fnVt31 = 0;
             if (SafeReadU32(edVt + 31 * 4, &fnVt31) && fnVt31 >= 0x10000) {
                 CallEditorVTableRebuildSeh(g_ctx.pEditorCat, fnVt31);
+            }
+
+            // Einmalig nach VT[31] sicherstellen, dass geklonte Schilder ihren Skin (+0x20) & CPlugTree (+0x5C) behalten
+            for (const auto& ov : g_clonedSignOverrides) {
+                ApplyClonedSignVisualOverrideToBlock(ov);
             }
 
             if (IsAnyHeapObject(sampleBlock)) {
@@ -1013,10 +1183,12 @@ struct ClipboardBlockData {
     uint32_t  dir;
     uint32_t  blockInfoId;      // Block + 0x14 (MwId des Blocktyps)
     uintptr_t blockInfoPtr;     // Block + 0x24 (CGameCtnBlockInfo*)
-    uint32_t  reservedFlags60;  // Block + 0x60
+    uint32_t  reservedFlags60;  // Block + 0x60 (VariantIndex + Flags)
 };
 
 static std::vector<ClipboardBlockData> g_clipboard;
+static std::vector<uintptr_t>          g_clipboardSkins;     // Parallel-Array für CGameCtnBlockSkin* (+0x20)
+static std::vector<uintptr_t>          g_clipboardPlugTrees; // Parallel-Array für CPlugTree* (CPlugSolid+0x5C)
 static std::string g_baseDir = ".\\";
 static std::string g_iniPath = ".\\BlockMover.ini";
 static bool        g_running = true;
@@ -1072,7 +1244,7 @@ static void ApplyKeybindPreset(int presetId) {
     g_cfg.keyToggleMenu = VK_F3;
     g_cfg.keyToggleModMode = VK_F6;
     g_cfg.keyBackToSelect = VK_BACK;
-    if (presetId == 0) { // Standard-Preset (gemäß deiner BlockMover.ini)
+    if (presetId == 0) { // Standard-Preset
         g_cfg.keySelectBlock = 'E';
         g_cfg.keyConfirmSelection = VK_NUMPAD0;
         g_cfg.keyMoveNorth = 'W';
@@ -1166,7 +1338,10 @@ static void LoadConfig() {
     const char* ini = g_iniPath.c_str();
     g_cfg.modEnabled = GetPrivateProfileIntA("BlockMover", "ModEnabled", 1, ini) != 0;
     g_cfg.language = ClampI32(GetPrivateProfileIntA("BlockMover", "Language", 1, ini), 0, 1);
-    g_cfg.ruleMode = GetPrivateProfileIntA("BlockMover", "RuleMode", 0, ini);
+    g_cfg.ruleMode = GetPrivateProfileIntA("BlockMover", "RuleMode", 1, ini);
+    if (GetModuleHandleA("TMUnlimiter.dll") != nullptr) {
+        g_cfg.ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
+    }
     g_cfg.cameraRelativeMove = GetPrivateProfileIntA("BlockMover", "CameraRelativeMove", 1, ini) != 0;
     g_cfg.cursorFollowsMove = GetPrivateProfileIntA("BlockMover", "CursorFollowsMove", 1, ini) != 0;
     g_cfg.rotateAsGroup = GetPrivateProfileIntA("BlockMover", "RotateAsGroup", 1, ini) != 0;
@@ -1327,7 +1502,7 @@ static void SelectBlocksOnSameHeightY() {
     SanitizeSelection();
     int32_t targetY = (!g_selectedBlocks.empty())
         ? ReadBlockCoord(g_selectedBlocks[0].blockAddr).y
-        : g_lastWorldCursorPos.y;
+        : ReadCursorCoord().y;
 
     RemoveAllSelectionPulses();
     g_selectedBlocks.clear();
@@ -1356,7 +1531,7 @@ static void SelectBlocksOfSameType() {
     SanitizeSelection();
     uintptr_t refBlock = (!g_selectedBlocks.empty())
         ? g_selectedBlocks[0].blockAddr
-        : FindBlockAtOrNearCursor(g_lastWorldCursorPos);
+        : FindBlockAtOrNearCursor(ReadCursorCoord());
     if (!IsAnyHeapObject(refBlock)) {
         PlayBeepSound(240, 80);
         return;
@@ -1385,7 +1560,9 @@ static void SelectBlocksOfSameType() {
 static void SetBoxCorner1AtCursor() {
     ScopedStateLock lock;
     if (!RefreshEditorContext()) { PlayBeepSound(240, 80); return; }
-    g_boxCorner1 = g_menuVisible ? g_lastWorldCursorPos : ReadCursorCoord();
+    Int3 cur = ReadCursorCoord();
+    if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = cur;
+    g_boxCorner1 = g_lastWorldCursorPos;
     g_hasBoxCorner1 = true;
     if (g_state == ModState::Inactive) g_state = ModState::Selecting;
     PlayBeepSound(850, 60);
@@ -1404,7 +1581,8 @@ static void SelectBlocksInBoxToCursor() {
     RemoveAllSelectionPulses();
     SanitizeSelection();
 
-    Int3 c2 = g_menuVisible ? g_lastWorldCursorPos : ReadCursorCoord();
+    Int3 c2 = ReadCursorCoord();
+    if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = c2;
     int32_t minX = MinI32(g_boxCorner1.x, c2.x), maxX = MaxI32(g_boxCorner1.x, c2.x);
     int32_t minZ = MinI32(g_boxCorner1.z, c2.z), maxZ = MaxI32(g_boxCorner1.z, c2.z);
 
@@ -1436,7 +1614,8 @@ static void ToggleBlockAtCursor() {
     }
     SanitizeSelection();
 
-    Int3 target = g_menuVisible ? g_lastWorldCursorPos : ReadCursorCoord();
+    Int3 target = ReadCursorCoord();
+    if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = target;
     uintptr_t chosen = FindBlockAtOrNearCursor(target);
     if (!chosen) {
         PlayBeepSound(300, 60);
@@ -1579,6 +1758,8 @@ static void LoadBlueprintFromFile(const std::string& groupName) {
     if (count > 0 && count < 100000) {
         g_clipboard.clear();
         g_clipboard.resize(count);
+        g_clipboardSkins.assign(count, 0);
+        g_clipboardPlugTrees.assign(count, 0);
         if (rem == static_cast<std::streamsize>(count * sizeof(ClipboardBlockData))) {
             file.read(reinterpret_cast<char*>(g_clipboard.data()), count * sizeof(ClipboardBlockData));
         }
@@ -1600,6 +1781,8 @@ static void CopySelectedBlocks() {
     SanitizeSelection();
     if (g_selectedBlocks.empty()) { PlayBeepSound(240, 80); return; }
     g_clipboard.clear();
+    g_clipboardSkins.clear();
+    g_clipboardPlugTrees.clear();
 
     Int3 anchor = ReadBlockCoord(g_selectedBlocks[0].blockAddr);
     for (const auto& entry : g_selectedBlocks) {
@@ -1609,14 +1792,17 @@ static void CopySelectedBlocks() {
 
     for (const auto& entry : g_selectedBlocks) {
         Int3 pos = ReadBlockCoord(entry.blockAddr);
-        uint32_t bId = 0, bInfo = 0, fl60 = 0;
+        uint32_t bId = 0, bInfo = 0, fl60 = 0, bSkin = 0;
         SafeReadU32(entry.blockAddr + 0x14, &bId);
+        SafeReadU32(entry.blockAddr + BLOCK_OFF_SKIN, &bSkin);
         SafeReadU32(entry.blockAddr + BLOCK_OFF_BLOCKINFO, &bInfo);
         SafeReadU32(entry.blockAddr + BLOCK_OFF_FLAGS60, &fl60);
         g_clipboard.push_back({
             { pos.x - anchor.x, pos.y - anchor.y, pos.z - anchor.z },
             ReadBlockDir(entry.blockAddr), bId, bInfo, fl60
             });
+        g_clipboardSkins.push_back(bSkin);
+        g_clipboardPlugTrees.push_back(ReadBlockPlugTree(entry.blockAddr));
     }
     PlayBeepSound(1100, 90);
 }
@@ -1627,9 +1813,17 @@ static void PasteFormationToSelection() {
     SanitizeSelection();
     if (g_clipboard.empty()) { PlayBeepSound(240, 80); return; }
 
-    bool isVanilla = (g_cfg.ruleMode == static_cast<int>(BuildRuleMode::Vanilla));
-    Int3 targetOrigin = g_menuVisible ? g_lastWorldCursorPos : ReadCursorCoord();
+    // Immer live den echten Spiel-Cursor lesen (und g_lastWorldCursorPos aktualisieren)
+    Int3 liveCur = ReadCursorCoord();
+    if (IsAnyHeapObject(g_ctx.pCursor)) {
+        g_lastWorldCursorPos = liveCur;
+    }
+    Int3 targetOrigin = g_lastWorldCursorPos;
+    if (targetOrigin.x > 31 || targetOrigin.y > 31 || targetOrigin.z > 31) {
+        g_cfg.ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
+    }
 
+    bool isVanilla = (g_cfg.ruleMode == static_cast<int>(BuildRuleMode::Vanilla));
     int32_t minX = isVanilla ? VANILLA_MIN_X : 0, maxX = isVanilla ? VANILLA_MAX_X : UNLIMITER_MAX;
     int32_t minY = 1, maxY = isVanilla ? VANILLA_MAX_Y : UNLIMITER_MAX;
     int32_t minZ = isVanilla ? VANILLA_MIN_Z : 0, maxZ = isVanilla ? VANILLA_MAX_Z : UNLIMITER_MAX;
@@ -1666,7 +1860,9 @@ static void PasteFormationToSelection() {
             ClampI32(targetOrigin.y + relY, minY, maxY),
             ClampI32(targetOrigin.z + relZ, minZ, maxZ)
         };
-        g_pendingSpawns.push_back({ bInfo, newPos, g_clipboard[i].dir & 3u });
+        uintptr_t skinPtr = (i < g_clipboardSkins.size()) ? g_clipboardSkins[i] : 0;
+        uintptr_t treePtr = (i < g_clipboardPlugTrees.size()) ? g_clipboardPlugTrees[i] : 0;
+        g_pendingSpawns.push_back({ bInfo, newPos, g_clipboard[i].dir & 3u, g_clipboard[i].reservedFlags60, skinPtr, treePtr });
     }
 
     g_selectedBlocks.clear();
@@ -1682,6 +1878,12 @@ static void MoveSelectedBlocks(int32_t dirX, int32_t dirY, int32_t dirZ) {
     SanitizeSelection();
     if (g_selectedBlocks.empty()) { PlayBeepSound(240, 60); return; }
 
+    // Falls Cursor oder ein Block bereits außerhalb von 0..31 liegt, automatisch TMUnlimiter-Grenzen (0..255) nutzen
+    Int3 curCheck = ReadCursorCoord();
+    if (curCheck.x > 31 || curCheck.y > 31 || curCheck.z > 31) {
+        g_cfg.ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
+    }
+
     bool isVanilla = (g_cfg.ruleMode == static_cast<int>(BuildRuleMode::Vanilla));
     int32_t minX = isVanilla ? VANILLA_MIN_X : 0, maxX = isVanilla ? VANILLA_MAX_X : UNLIMITER_MAX;
     int32_t minY = isVanilla ? VANILLA_MIN_Y : 1, maxY = isVanilla ? VANILLA_MAX_Y : UNLIMITER_MAX;
@@ -1691,19 +1893,31 @@ static void MoveSelectedBlocks(int32_t dirX, int32_t dirY, int32_t dirZ) {
     int32_t dy = dirY * g_cfg.stepMultiplier;
     int32_t dz = dirZ * g_cfg.stepMultiplier;
 
-    int totalVisualHits = 0;
-    int movedBlocksCount = 0;
-
-    for (auto& entry : g_selectedBlocks) {
-        uintptr_t block = entry.blockAddr;
-        Int3 oldPos = ReadBlockCoord(block);
-
+    // 1. Zuerst prüfen, ob ALLE ausgewählten Blöcke innerhalb der Grenzen bleiben,
+    //    damit eine Formation am Rand niemals auseinandergerissen wird!
+    for (const auto& entry : g_selectedBlocks) {
+        Int3 oldPos = ReadBlockCoord(entry.blockAddr);
+        if (oldPos.x > 31 || oldPos.y > 31 || oldPos.z > 31) {
+            minX = 0; maxX = UNLIMITER_MAX;
+            minY = 1; maxY = UNLIMITER_MAX;
+            minZ = 0; maxZ = UNLIMITER_MAX;
+        }
         if (oldPos.x + dx < minX || oldPos.x + dx > maxX ||
             oldPos.y + dy < minY || oldPos.y + dy > maxY ||
             oldPos.z + dz < minZ || oldPos.z + dz > maxZ) {
-            continue;
+            ApplyAllSelectionPulses();
+            PlayBeepSound(240, 80);
+            return;
         }
+    }
 
+    int totalVisualHits = 0;
+    int movedBlocksCount = 0;
+
+    // 2. Alle Blöcke synchron bewegen
+    for (auto& entry : g_selectedBlocks) {
+        uintptr_t block = entry.blockAddr;
+        Int3 oldPos = ReadBlockCoord(block);
         Int3 newPos = { oldPos.x + dx, oldPos.y + dy, oldPos.z + dz };
         WriteBlockCoord(block, newPos);
         totalVisualHits += MoveBlockVisualsTargeted(block, dx * 32.0f, dy * 8.0f, dz * 32.0f);
@@ -1711,12 +1925,6 @@ static void MoveSelectedBlocks(int32_t dirX, int32_t dirY, int32_t dirZ) {
     }
 
     g_lastMovedFloats = totalVisualHits;
-
-    if (movedBlocksCount == 0) {
-        ApplyAllSelectionPulses();
-        PlayBeepSound(240, 80);
-        return;
-    }
 
     if (g_cfg.cursorFollowsMove) {
         Int3 c = ReadBlockCoord(g_selectedBlocks[0].blockAddr);
@@ -1856,6 +2064,62 @@ static uintptr_t g_foundD3DDeviceAddr = 0;
 static uintptr_t g_foundViewportAddr = 0;
 static int       g_hookedVTableCount = 0;
 
+static void DumpDeepBlockVisualHierarchy(std::ofstream& out, uintptr_t blockAddr, const char* label) {
+    if (!IsAnyHeapObject(blockAddr)) return;
+    char buf[256];
+    Int3 bc = ReadBlockCoord(blockAddr);
+    uint32_t bd = ReadBlockDir(blockAddr);
+    uint32_t fl60 = 0, skinPtr = 0, mob0 = 0;
+    SafeReadU32(blockAddr + BLOCK_OFF_FLAGS60, &fl60);
+    SafeReadU32(blockAddr + BLOCK_OFF_SKIN, &skinPtr);
+    SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &mob0);
+
+    sprintf_s(buf, "\n================ %s [0x%08X] Coord=(%d,%d,%d) Dir=%u Flags60=0x%08X Skin=0x%08X ================\n",
+        label, (uint32_t)blockAddr, bc.x, bc.y, bc.z, bd, fl60, skinPtr);
+    out << buf;
+
+    DumpMemoryRangeToStream(out, "CGameCtnBlock", blockAddr, 0x68);
+
+    if (IsAnyHeapObject(skinPtr)) {
+        DumpMemoryRangeToStream(out, "CGameCtnBlockSkin (+0x20)", skinPtr, 0x40);
+    }
+
+    if (IsAnyHeapObject(mob0)) {
+        DumpMemoryRangeToStream(out, "CSceneMobil (+0x30)", mob0, 0x60);
+
+        uint32_t item20 = 0, hmsItem28 = 0;
+        if (SafeReadU32(mob0 + 0x20, &item20) && IsAnyHeapObject(item20)) {
+            DumpMemoryRangeToStream(out, "Mobil+0x20 Object", item20, 0x80);
+        }
+        if (SafeReadU32(mob0 + 0x28, &hmsItem28) && IsAnyHeapObject(hmsItem28)) {
+            DumpMemoryRangeToStream(out, "CHmsItem (Mobil+0x28)", hmsItem28, 0x80);
+
+            for (int off = 0x04; off < 0x60; off += 4) {
+                uint32_t subPtr = 0;
+                if (SafeReadU32(hmsItem28 + off, &subPtr) && IsAnyHeapObject(subPtr)) {
+                    char subTitle[64];
+                    sprintf_s(subTitle, "CHmsItem+0x%02X (%s)", off,
+                        GetHeapObjectClassName(subPtr) ? GetHeapObjectClassName(subPtr) : "Obj");
+                    DumpMemoryRangeToStream(out, subTitle, subPtr, 0x60);
+                }
+            }
+
+            uint32_t cCnt = 0, cArr = 0;
+            if (SafeReadU32(hmsItem28 + 0x34, &cCnt) && SafeReadU32(hmsItem28 + 0x38, &cArr) &&
+                cCnt > 0 && cCnt <= 8 && IsSafeWritableHeapAddr(cArr)) {
+                for (uint32_t i = 0; i < cCnt; ++i) {
+                    uint32_t corp = 0;
+                    if (SafeReadU32(cArr + i * 4, &corp) && IsAnyHeapObject(corp)) {
+                        char cTitle[64];
+                        sprintf_s(cTitle, "CHmsCorpus[%u]", i);
+                        DumpMemoryRangeToStream(out, cTitle, corp, 0x80);
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void WriteDiagnosticFile() {
     RemoveAllSelectionPulses();
     RefreshEditorContext();
@@ -1876,25 +2140,42 @@ static void WriteDiagnosticFile() {
         (uint32_t)g_ctx.pChallenge, g_ctx.blockCount, (uint32_t)g_ctx.pBlocksArray); out << buf;
     sprintf_s(buf, "SelectedBlocks:       %u | LastMoved3DFloats: %d | LastSpawned: %u\n",
         (uint32_t)g_selectedBlocks.size(), g_lastMovedFloats, g_lastSpawnedCount); out << buf;
-    sprintf_s(buf, "RebuildExecCount:     %u | MobilSceneUpdates: %u | LastRebuildEx: 0x%08X | MobilBefore: 0x%08X -> MobilAfter: 0x%08X\n",
-        g_rebuildExecCount, g_mobilSceneUpdateCount, g_lastRebuildException, (uint32_t)g_mobilBeforeRebuild, (uint32_t)g_mobilAfterRebuild); out << buf;
-    sprintf_s(buf, "D3D9HookedVTables:    %d | EndSceneCalls: %u | FoundDev: 0x%08X | FoundViewport: 0x%08X\n",
-        g_hookedVTableCount, g_endSceneCallCount, (uint32_t)g_foundD3DDeviceAddr, (uint32_t)g_foundViewportAddr); out << buf;
-    sprintf_s(buf, "CamMatrix:            has3D=%d | Right=(%.2f, %.2f) | Fwd=(%.2f, %.2f) | Proj11=%.2f Proj34=%.2f\n",
-        (int)g_d3dHas3DMatrices, g_d3dView._11, g_d3dView._31, g_d3dView._13, g_d3dView._33, g_d3dProj._11, g_d3dProj._34); out << buf;
 
-    uintptr_t targetBlock = (!g_selectedBlocks.empty() && IsAnyHeapObject(g_selectedBlocks[0].blockAddr))
-        ? g_selectedBlocks[0].blockAddr : g_lastMovedBlockAddr;
+    // 1. Dumpe den ausgewählten Block IMMER zuerst!
+    if (!g_selectedBlocks.empty() && IsAnyHeapObject(g_selectedBlocks[0].blockAddr)) {
+        DumpDeepBlockVisualHierarchy(out, g_selectedBlocks[0].blockAddr, "SELECTED-BLOCK [0]");
+    }
 
-    if (IsAnyHeapObject(targetBlock)) {
-        Int3 bc = ReadBlockCoord(targetBlock);
-        uint32_t bd = ReadBlockDir(targetBlock);
-        std::vector<uintptr_t> mobils;
-        GetBlockSceneMobils(targetBlock, mobils);
-        sprintf_s(buf, "\nZiel-Block: 0x%08X | Coord=(%d,%d,%d) World=(%.1f, %.1f, %.1f) Dir=%u | MobilsCount=%u\n",
-            (uint32_t)targetBlock, bc.x, bc.y, bc.z, bc.x * 32.0f, bc.y * 8.0f, bc.z * 32.0f, bd, (uint32_t)mobils.size());
-        out << buf;
-        DumpMemoryRangeToStream(out, "CGameCtnBlock", targetBlock, 0x68);
+    // 2. Dumpe die neuesten Skin-Blöcke RÜCKWÄRTS (vom Ende des Arrays abwärts, damit der Klon ganz oben steht!)
+    if (g_ctx.pBlocksArray && g_ctx.blockCount > 0) {
+        int skinBlockIdx = 0;
+        for (int32_t i = static_cast<int32_t>(g_ctx.blockCount) - 1; i >= 0 && skinBlockIdx < 4; --i) {
+            uint32_t b = 0, sk = 0;
+            if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && IsAnyHeapObject(b) &&
+                SafeReadU32(b + BLOCK_OFF_SKIN, &sk) && IsAnyHeapObject(sk)) {
+                char lbl[64];
+                sprintf_s(lbl, "LATEST-SKIN-BLOCK #%d (ArrayIdx=%d)", skinBlockIdx, i);
+                DumpDeepBlockVisualHierarchy(out, b, lbl);
+                ++skinBlockIdx;
+            }
+        }
+    }
+
+    // 3. Dumpe die CPlugTree-Struktur des neuesten Skin-Blocks und die SetSkin-Engine-Funktionen:
+    if (g_exeStart != 0) {
+        const uint32_t rvas[] = { 0x2FD400, 0x2FD4E0, 0x4A2FD0, 0x4DE290 };
+        for (uint32_t rva : rvas) {
+            uintptr_t fnStart = g_exeStart + rva;
+            sprintf_s(buf, "\n--- Exe Code @ RVA 0x%06X (0x%08X) ---\n  ", rva, (uint32_t)fnStart);
+            out << buf;
+            for (int k = 0; k < 128; ++k) {
+                uint8_t b = 0;
+                SafeReadByte(fnStart + k, &b);
+                sprintf_s(buf, "%02X ", b);
+                out << buf;
+                if ((k & 15) == 15) out << "\n  ";
+            }
+        }
     }
 
     out.close();
@@ -2273,13 +2554,19 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
     ImGui::NewFrame();
     g_imguiWantKeyboard = g_menuVisible && (io.WantCaptureKeyboard || io.WantTextInput);
 
-    if (inEditor && !g_menuVisible) {
-        g_lastWorldCursorPos = ReadCursorCoord();
+    // Immer live mit dem echten Editor-Cursor synchronisieren, sobald dieser im Spiel bewegt wird
+    if (inEditor) {
+        static Int3 s_prevHwCursor = { -1, -1, -1 };
+        Int3 hwCur = ReadCursorCoord();
+        if (hwCur.x != s_prevHwCursor.x || hwCur.y != s_prevHwCursor.y || hwCur.z != s_prevHwCursor.z) {
+            g_lastWorldCursorPos = hwCur;
+            s_prevHwCursor = hwCur;
+        }
     }
 
     RenderImGuiSelectionBoxes3D(pDevice);
 
-    Int3 curPos = g_menuVisible ? g_lastWorldCursorPos : ReadCursorCoord();
+    Int3 curPos = g_lastWorldCursorPos;
     const char* modeShort = !g_cfg.modEnabled ? TR("DEAKTIVIERT", "DISABLED") :
         (g_state == ModState::Inactive) ? TR("PAUSIERT", "PAUSED") :
         (!g_selectedBlocks.empty()) ? TR("BEWEGEN AKTIV", "MOVING ACTIVE") : TR("AUSWAHL BEREIT", "SELECT READY");
@@ -2330,10 +2617,12 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
                     g_lastWorldCursorPos.x = ClampI32(g_lastWorldCursorPos.x, 0, UNLIMITER_MAX);
                     g_lastWorldCursorPos.y = ClampI32(g_lastWorldCursorPos.y, 1, UNLIMITER_MAX);
                     g_lastWorldCursorPos.z = ClampI32(g_lastWorldCursorPos.z, 0, UNLIMITER_MAX);
+                    WriteCursorCoord(g_lastWorldCursorPos);
                 }
                 ImGui::SameLine();
                 if (ImGui::Button(TR("Auf Auswahl[0]", "To Selection[0]")) && !g_selectedBlocks.empty()) {
                     g_lastWorldCursorPos = ReadBlockCoord(g_selectedBlocks[0].blockAddr);
+                    WriteCursorCoord(g_lastWorldCursorPos);
                 }
             }
 
@@ -2394,7 +2683,11 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
 
                         if (ImGui::Button(TR("Links##dp", "Left##dp"), ImVec2(80.0f, 28.0f))) MoveSelectedBlocksCameraRelative(0, -1, 0);
                         ImGui::SameLine();
-                        if (ImGui::Button(TR("Zum Cursor!", "To Cursor!"), ImVec2(84.0f, 28.0f))) TeleportSelectedBlocksToTarget(curPos);
+                        if (ImGui::Button(TR("Zum Cursor!", "To Cursor!"), ImVec2(84.0f, 28.0f))) {
+                            Int3 liveTarget = ReadCursorCoord();
+                            if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = liveTarget;
+                            TeleportSelectedBlocksToTarget(g_lastWorldCursorPos);
+                        }
                         ImGui::SameLine();
                         if (ImGui::Button(TR("Rechts##dp", "Right##dp"), ImVec2(80.0f, 28.0f))) MoveSelectedBlocksCameraRelative(0, 1, 0);
 
@@ -2439,8 +2732,8 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
                 if (ImGui::BeginTabItem(TR("2. Blaupausen (.tmgroup)", "2. Blueprints (.tmgroup)"))) {
                     float availW = ImGui::GetContentRegionAvail().x;
                     ImGui::TextColored(ImVec4(0.00f, 0.88f, 1.00f, 1.0f),
-                        TR("Spawnt exakt am Ziel-Cursor (%d, %d, %d) in der Luft & am Boden",
-                            "Spawns strictly at Target Cursor (%d, %d, %d) in air & on ground"),
+                        TR("Spawnt exakt am Ziel-Cursor (%d, %d, %d) inkl. Block-Variante & Schild-Skin",
+                            "Spawns strictly at Target Cursor (%d, %d, %d) preserving Variant & Sign Skin"),
                         curPos.x, curPos.y, curPos.z);
 
                     ImGui::Checkbox(TR("Horizontal (X/Z) am Cursor zentrieren (Aus = Exakt ab Block[0]-Anker)",
@@ -2883,6 +3176,7 @@ static void UpdateStatusBanner() {
     if (!mapOk || g_ctx.pChallenge != lastChallengePtr) {
         g_selectedBlocks.clear();
         g_dirtyBlocks.clear();
+        g_clonedSignOverrides.clear();
         g_lastMovedBlockAddr = 0;
         lastChallengePtr = g_ctx.pChallenge;
     }
@@ -2990,7 +3284,8 @@ DWORD WINAPI ModThread(LPVOID lpParam) {
                     if (WasKeyPressed(g_cfg.keyRotateCCW)) RotateSelectedBlocks(false);
 
                     if (WasKeyPressed(g_cfg.keyTeleportToCursor)) {
-                        Int3 target = g_menuVisible ? g_lastWorldCursorPos : ReadCursorCoord();
+                        Int3 target = ReadCursorCoord();
+                        g_lastWorldCursorPos = target;
                         TeleportSelectedBlocksToTarget(target);
                     }
                     if (WasKeyPressed(g_cfg.keyCloneAtCursor)) {
