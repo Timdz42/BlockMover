@@ -62,9 +62,9 @@ It enables real-time 3D block manipulation, camera-relative movement, smart mult
 ### Step 3: Activate Mods in TMLoader (`◆` Diamond Icons)
 1. Launch **`TMLoader.exe`** and select or edit your game profile.
 2. In the mod list, make sure you enable **all three** of the following mods by clicking the **diamond icon** next to them:
-   * **`◆` CoreMod** *(Modded Forever)*
-   * **`◆` TMUnlimiter** *(2.0.2)*
-   * **`◆` BlockMover** *(1.0.0)*
+   * **`◆` CoreMod**
+   * **`◆` TMUnlimiter**
+   * **`◆` BlockMover**
    > 💡 **Important:** A mod is only active when its diamond icon is **filled (`◆`)**. If the diamond is **hollow (`◇`)**, the mod is disabled—click the diamond once so it becomes filled!
 3. Launch the game via **TMLoader**, open any map in the **Track Editor**, and press **`F3`** to open or close the BlockMover Studio overlay.
 
