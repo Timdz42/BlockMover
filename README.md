@@ -4,7 +4,7 @@
 
 **Real-Time 3D Track Editor & Blueprint Suite for TrackMania Nations Forever**
 
-[![Release](https://img.shields.io/badge/Release-v1.0.0-00e5ff?style=for-the-badge)](../../releases)
+[![Release](https://img.shields.io/badge/Release-v1.2.0-00e5ff?style=for-the-badge)](../../releases)
 [![Platform](https://img.shields.io/badge/Platform-Win32%20(x86)-0078d7?style=for-the-badge&logo=windows)](#)
 [![DirectX](https://img.shields.io/badge/DirectX-9.0c-107c10?style=for-the-badge)](#)
 [![Loader](https://img.shields.io/badge/TMLoader-Modded%20Forever%202.13-ff9800?style=for-the-badge)](#)
