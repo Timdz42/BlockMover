@@ -24,7 +24,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #pragma comment(lib, "d3d9.lib")
 
 // ============================================================================
-// 1. Sichere Speicher- & Hilfsfunktionen
+// 1. Safe Memory & Engine Helper Functions
 // ============================================================================
 
 struct Int3 { int32_t x, y, z; };
@@ -41,8 +41,10 @@ static uintptr_t g_exeEnd = 0;
 constexpr uintptr_t RVA_APP_SINGLETON_1 = 0x00968C44;
 constexpr uintptr_t RVA_APP_SINGLETON_2 = 0x00972EB8;
 
-constexpr int BLOCK_OFF_SKIN = 0x20; // CGameCtnBlockSkin* (Schilder / Custom-Links)
+constexpr int BLOCK_OFF_SKIN = 0x20; // CGameCtnBlockSkin*
 constexpr int BLOCK_OFF_BLOCKINFO = 0x24; // CGameCtnBlockInfo*
+constexpr int BLOCK_OFF_UNIT_CNT = 0x28; // uint32_t unitCount
+constexpr int BLOCK_OFF_UNIT_ARR = 0x2C; // CGameCtnBlockUnit**
 constexpr int BLOCK_OFF_MOBIL_1 = 0x30; // CSceneMobil*
 constexpr int BLOCK_OFF_NOD_40 = 0x40;
 constexpr int BLOCK_OFF_MOBIL_2 = 0x44;
@@ -50,7 +52,7 @@ constexpr int BLOCK_OFF_COORD_X = 0x48;
 constexpr int BLOCK_OFF_COORD_Y = 0x4C;
 constexpr int BLOCK_OFF_COORD_Z = 0x50;
 constexpr int BLOCK_OFF_DIR = 0x54; // 0 = North, 1 = East, 2 = South, 3 = West
-constexpr int BLOCK_OFF_FLAGS60 = 0x60; // Bits 0..5 = Variant, 0x1000 = IsGround, 0x2000 = Clip, 0x8000 = HasSkin
+constexpr int BLOCK_OFF_FLAGS60 = 0x60; // Bits 0..5 = Variant, 0x1000 = IsGround, 0x2000 = Clip, 0x4000 = Connected, 0x8000 = HasSkin
 
 static CRITICAL_SECTION g_stateCs;
 static bool             g_csInitialized = false;
@@ -225,7 +227,7 @@ static int DetectHeapChunkEndOffset(uintptr_t baseAddr, int maxScanBytes) {
 }
 
 // ============================================================================
-// 2. Konfiguration, Sprache (DE/EN) & Globale Statusvariablen
+// 2. Configuration, Localization (EN/DE) & Global State
 // ============================================================================
 
 constexpr int32_t VANILLA_MIN_X = 0, VANILLA_MAX_X = 31;
@@ -240,10 +242,10 @@ static ModState g_state = ModState::Selecting;
 
 struct ModConfig {
     bool modEnabled = true;
-    int  language = 1; // 1 = English, 0 = Deutsch
-    int  ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
+    int  language = 1; // 1 = English (default), 0 = Deutsch
+    int  ruleMode = static_cast<int>(BuildRuleMode::Vanilla);
     bool cameraRelativeMove = true;
-    bool cursorFollowsMove = true;
+    bool cursorFollowsMove = false; // Default false so mouse cursor never shakes/fights the game
     bool rotateAsGroup = true;
     bool soundFeedback = true;
     bool visualHighlight = true;
@@ -251,25 +253,25 @@ struct ModConfig {
     bool onlyPlayerBlocks = true;
     int  stepMultiplier = 1;
 
-    // Standard-Keybinds
-    int keyToggleMenu = VK_F3;      // 114
-    int keyToggleModMode = VK_F6;      // 117
-    int keySelectBlock = 'E';        // 69
+    // Default Keybinds
+    int keyToggleMenu = VK_F3;            // 114
+    int keyToggleModMode = VK_F4;         // 115
+    int keySelectBlock = 'E';             // 69
     int keyConfirmSelection = VK_NUMPAD0; // 96
-    int keyBackToSelect = VK_BACK;    // 8
+    int keyBackToSelect = VK_BACK;        // 8
 
-    int keyMoveNorth = 'W';        // 87
-    int keyMoveSouth = 'V';        // 86
-    int keyMoveWest = 'A';        // 65
-    int keyMoveEast = 'D';        // 68
-    int keyMoveUp = VK_PRIOR;   // 33 (Page Up / Bild Hoch)
-    int keyMoveDown = VK_NEXT;    // 34 (Page Down / Bild Runter)
-    int keyRotateCW = 'R';        // 82
-    int keyRotateCCW = 'Q';        // 81
+    int keyMoveNorth = 'W';               // 87
+    int keyMoveSouth = 'V';               // 86
+    int keyMoveWest = 'A';                // 65
+    int keyMoveEast = 'D';                // 68
+    int keyMoveUp = VK_PRIOR;             // 33 (Page Up)
+    int keyMoveDown = VK_NEXT;            // 34 (Page Down)
+    int keyRotateCW = 'R';                // 82
+    int keyRotateCCW = 'Q';               // 81
 
-    // Direkt-Werkzeuge (0 = Nicht belegt)
+    // Optional Direct Tools (0 = Unbound)
     int keyTeleportToCursor = VK_NUMPAD5; // 101
-    int keyCloneAtCursor = 'L';        // 76
+    int keyCloneAtCursor = 'L';           // 76
     int keySelectLastBuilt = 0;
     int keySelectAllBlocks = 0;
     int keySelectSameHeight = 0;
@@ -278,7 +280,7 @@ struct ModConfig {
     int keyBoxSelect2 = 0;
     int keyStepSizeCycle = 0;
     int keyCopySelection = 0;
-    int keyPasteBlueprint = 'I';        // 73
+    int keyPasteBlueprint = 'I';          // 73
 };
 
 static ModConfig g_cfg;
@@ -288,12 +290,12 @@ static const char* TR(const char* de, const char* en) {
 }
 
 // ============================================================================
-// 3. Exakter Zugriff auf CSceneMobils, CHmsItem & CHmsCorpus
+// 3. Direct Access to CSceneMobils, CHmsItem & CHmsCorpus
 // ============================================================================
 
 struct DynamicEditorContext {
     uintptr_t pApp = 0;
-    uintptr_t pEditorCat = 0;   // pApp+0x414 (CGameCtnEditorFree)
+    uintptr_t pEditorCat = 0;   // pApp+0x414
     uintptr_t pCursor = 0;      // pEditorCat+0xBC (CGameCtnCursor)
     uintptr_t pChallenge = 0;   // pApp+0x198 (CGameCtnChallenge)
     uintptr_t pBlocksArray = 0; // pChallenge+0x58
@@ -311,6 +313,9 @@ static std::vector<uintptr_t>          g_dirtyBlocks;
 static uintptr_t                       g_cachedAppPtrAddr = 0;
 static int                             g_lastMovedFloats = 0;
 static uintptr_t                       g_lastMovedBlockAddr = 0;
+static volatile bool                   g_needVt31Rebuild = false;
+static ULONGLONG                       g_deferredVt31Tick = 0;
+static bool                            g_useSingleBoundingBox = false;
 
 static bool IsBlockSelected(uintptr_t blockAddr) {
     for (const auto& e : g_selectedBlocks) {
@@ -345,12 +350,21 @@ static uint32_t ReadBlockDir(uintptr_t blockAddr) {
 static void WriteBlockDir(uintptr_t blockAddr, uint32_t dir) {
     if (!IsAnyHeapObject(blockAddr)) return;
     SafeWriteU32(blockAddr + BLOCK_OFF_DIR, dir & 3u);
+    g_needVt31Rebuild = true;
 }
 
+static uint32_t g_cachedSceneMobilVTable = 0;
+static uint32_t g_cachedHmsCorpusVTable = 0;
+
 static void AddUniqueMobilPtr(std::vector<uintptr_t>& outMobils, uintptr_t mob, uintptr_t blockAddr, bool isChildMobil = false) {
-    if (!IsAnyHeapObject(mob)) return;
-    const char* cn = GetHeapObjectClassName(mob);
-    if (!cn || !ClassStartsWith(cn, "CSceneMobil")) return;
+    uint32_t vt = 0;
+    if (!IsAnyHeapObject(mob, &vt)) return;
+
+    if (g_cachedSceneMobilVTable == 0 || vt != g_cachedSceneMobilVTable) {
+        const char* cn = GetHeapObjectClassName(mob);
+        if (!cn || !ClassStartsWith(cn, "CSceneMobil")) return;
+        if (g_cachedSceneMobilVTable == 0) g_cachedSceneMobilVTable = vt;
+    }
 
     if (!isChildMobil) {
         uint32_t ownerBlock = 0;
@@ -370,13 +384,13 @@ static void GetBlockSceneMobils(uintptr_t blockAddr, std::vector<uintptr_t>& out
     outMobils.clear();
     if (!IsAnyHeapObject(blockAddr)) return;
 
-    for (int off = 0x28; off <= 0x64; off += 4) {
-        if (off == BLOCK_OFF_COORD_X || off == BLOCK_OFF_COORD_Y || off == BLOCK_OFF_COORD_Z ||
-            off == BLOCK_OFF_DIR || off == BLOCK_OFF_NOD_40 || off == BLOCK_OFF_FLAGS60) continue;
-        uint32_t ptr = 0;
-        if (!SafeReadU32(blockAddr + off, &ptr)) continue;
-        bool isDirectSlot = (off == BLOCK_OFF_MOBIL_1 || off == BLOCK_OFF_MOBIL_2);
-        AddUniqueMobilPtr(outMobils, ptr, blockAddr, isDirectSlot);
+    // Direkt die bekannten Mobil-Slots (+0x30 und +0x44) prüfen statt 10 Offsets inkl. RTTI zu scannen
+    uint32_t ptr1 = 0, ptr2 = 0;
+    if (SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &ptr1) && ptr1 >= 0x10000) {
+        AddUniqueMobilPtr(outMobils, ptr1, blockAddr, true);
+    }
+    if (SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_2, &ptr2) && ptr2 >= 0x10000) {
+        AddUniqueMobilPtr(outMobils, ptr2, blockAddr, true);
     }
 
     for (size_t i = 0; i < outMobils.size() && outMobils.size() < 32; ++i) {
@@ -396,57 +410,76 @@ static void GetBlockSceneMobils(uintptr_t blockAddr, std::vector<uintptr_t>& out
 
 static bool IsStadiumPerimeterBlockInfo(uintptr_t blockInfo) {
     if (!IsAnyHeapObject(blockInfo)) return false;
-    for (int off = 0x14; off <= 0x40; off += 4) {
+    static uintptr_t s_cachedInfo = 0;
+    static bool      s_cachedResult = false;
+    if (blockInfo == s_cachedInfo) return s_cachedResult;
+
+    bool isPerim = false;
+    for (int off = 0x18; off <= 0x38; off += 4) {
         uint32_t strPtr = 0;
-        if (SafeReadU32(blockInfo + off, &strPtr) && strPtr >= 0x10000) {
-            __try {
-                const char* s = reinterpret_cast<const char*>(strPtr);
-                if (s[0] >= 'A' && s[0] <= 'Z') {
-                    if (std::strncmp(s, "Stadium", 7) == 0 &&
-                        (std::strstr(s, "Warp") != nullptr || std::strstr(s, "Tribune") != nullptr ||
-                            std::strstr(s, "Sculpt") != nullptr || std::strstr(s, "Screen") != nullptr ||
-                            std::strstr(s, "Light") != nullptr)) {
-                        return true;
-                    }
-                }
+        if (!SafeReadU32(blockInfo + off, &strPtr) || strPtr < 0x10000) continue;
+        uint32_t hiByte = strPtr & 0xFF000000u;
+        if (hiByte == 0x40000000u || hiByte == 0x3F000000u || hiByte == 0x3E000000u || hiByte >= 0x80000000u) continue;
+        uint32_t first4 = 0;
+        if (!SafeReadU32(strPtr, &first4)) continue;
+        if ((first4 & 0xFFu) != 'S') continue;
+
+        __try {
+            const char* s = reinterpret_cast<const char*>(strPtr);
+            if (std::strncmp(s, "Stadium", 7) == 0 &&
+                (std::strstr(s, "Warp") != nullptr || std::strstr(s, "Tribune") != nullptr ||
+                    std::strstr(s, "Sculpt") != nullptr || std::strstr(s, "Screen") != nullptr ||
+                    std::strstr(s, "Light") != nullptr)) {
+                isPerim = true;
+                break;
             }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
-    return false;
+    s_cachedInfo = blockInfo;
+    s_cachedResult = isPerim;
+    return isPerim;
 }
 
 static bool IsMovableTrackBlock(uintptr_t blockAddr) {
     if (!IsAnyHeapObject(blockAddr)) return false;
 
-    uint32_t blockInfo = 0;
-    if (SafeReadU32(blockAddr + BLOCK_OFF_BLOCKINFO, &blockInfo) && IsAnyHeapObject(blockInfo)) {
-        const char* biName = GetHeapObjectClassName(blockInfo);
-        // Nur reine Gras-Bodenkacheln (Flat), Auto-Clips und Stützpfeiler ausschließen:
-        if (biName && (ClassContainsWord(biName, "BlockInfoClip") ||
-            ClassContainsWord(biName, "BlockInfoFlat") ||
-            ClassContainsWord(biName, "BlockInfoPylon"))) {
-            return false;
-        }
-    }
-
     uint32_t flags60 = 0;
     if (SafeReadU32(blockAddr + BLOCK_OFF_FLAGS60, &flags60)) {
-        // WICHTIG: 0x1000 NICHT ausschließen! 0x1000 = IsGround (normale Blöcke, die auf dem Boden stehen).
-        // Nur 0x2000 (Auto-Clip), 0x3F (System-Variante) und 0x10000000/0x20000000 (feste Stadion-Umgebung) ausschließen:
         if ((flags60 & 0x2000u) != 0 || (flags60 & 0x3Fu) == 0x3Fu || (flags60 & 0x30000000u) != 0) {
             return false;
         }
     }
 
+    uint32_t mob1 = 0, mob2 = 0;
+    SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &mob1);
+    SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_2, &mob2);
+    if (!IsAnyHeapObject(mob1) && !IsAnyHeapObject(mob2)) {
+        return false;
+    }
+
+    Int3 c = ReadBlockCoord(blockAddr);
+
+    uint32_t blockInfo = 0;
+    if (SafeReadU32(blockAddr + BLOCK_OFF_BLOCKINFO, &blockInfo) && IsAnyHeapObject(blockInfo)) {
+        const char* biName = GetHeapObjectClassName(blockInfo);
+        if (biName) {
+            if (ClassContainsWord(biName, "BlockInfoClip") || ClassContainsWord(biName, "BlockInfoPylon")) {
+                return false;
+            }
+            // BlockInfoFlat auf Y <= 1 sind die normalen Stadion-Grasbodenkacheln;
+            // auf Y >= 2 sind es schwebende Terrain-Blöcke (Hügel/Plattformen in der Luft) -> mitbewegen!
+            if (ClassContainsWord(biName, "BlockInfoFlat") && c.y <= 1) {
+                return false;
+            }
+        }
+    }
+
     if (g_cfg.onlyPlayerBlocks && !IsBlockSelected(blockAddr)) {
-        Int3 c = ReadBlockCoord(blockAddr);
         if (c.y <= 0 || IsStadiumPerimeterBlockInfo(blockInfo)) return false;
     }
 
-    std::vector<uintptr_t> mobils;
-    GetBlockSceneMobils(blockAddr, mobils);
-    return !mobils.empty();
+    return true;
 }
 
 static void WriteBlockCoord(uintptr_t blockAddr, const Int3& newC) {
@@ -454,6 +487,378 @@ static void WriteBlockCoord(uintptr_t blockAddr, const Int3& newC) {
     SafeWriteU32(blockAddr + BLOCK_OFF_COORD_X, static_cast<uint32_t>(newC.x));
     SafeWriteU32(blockAddr + BLOCK_OFF_COORD_Y, static_cast<uint32_t>(newC.y));
     SafeWriteU32(blockAddr + BLOCK_OFF_COORD_Z, static_cast<uint32_t>(newC.z));
+
+    uint32_t flags60 = 0;
+    if (SafeReadU32(blockAddr + BLOCK_OFF_FLAGS60, &flags60)) {
+        uint32_t updated = (newC.y <= 1) ? (flags60 | 0x1000u) : (flags60 & ~0x1000u);
+        if (updated != flags60) SafeWriteU32(blockAddr + BLOCK_OFF_FLAGS60, updated);
+    }
+
+    g_needVt31Rebuild = true;
+}
+
+// ============================================================================
+// 3b. Auto-Calibrating Multi-Unit Block Dimensions (CGameCtnBlockUnit / Info)
+// ============================================================================
+
+enum class BlockUnitOffsetMode : int {
+    None = 0,
+    UnitInfoLocalU32, // CGameCtnBlockUnit -> CGameCtnBlockUnitInfo* -> local nat3 Offset (rotated by Dir)
+    UnitAbsU32,       // CGameCtnBlockUnit -> absolute map nat3 Coord
+    UnitRelU32,       // CGameCtnBlockUnit -> relative nat3 Offset
+    UnitRelU8         // CGameCtnBlockUnit -> packed uint8 x,y,z
+};
+
+struct BlockUnitLayoutInfo {
+    bool                calibrated = false;
+    BlockUnitOffsetMode mode = BlockUnitOffsetMode::None;
+    int                 unitPtrOff = -1;
+    int                 dataOff = -1;
+    bool                relAlreadyRotated = true;
+};
+
+static BlockUnitLayoutInfo g_unitLayout;
+
+static void RotateLocalUnitOffset(int32_t lx, int32_t ly, int32_t lz, int32_t sizeX, int32_t sizeZ, uint32_t dir, int32_t& outRx, int32_t& outRy, int32_t& outRz) {
+    outRy = ly;
+    switch (dir & 3u) {
+    case 0: outRx = lx;                 outRz = lz;                 break;
+    case 1: outRx = (sizeZ - 1) - lz;   outRz = lx;                 break;
+    case 2: outRx = (sizeX - 1) - lx;   outRz = (sizeZ - 1) - lz;   break;
+    case 3: outRx = lz;                 outRz = (sizeX - 1) - lx;   break;
+    }
+}
+
+static bool ReadBlockCorpusGridCornerDelta(uintptr_t blockAddr, int32_t& outDx, int32_t& outDz) {
+    uint32_t mob = 0, hmsItem = 0, cCnt = 0, cArr = 0, corp0 = 0;
+    float cx = 0.0f, cz = 0.0f;
+    if (!SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &mob) || !IsAnyHeapObject(mob)) return false;
+    if (!SafeReadU32(mob + 0x28, &hmsItem) || !IsAnyHeapObject(hmsItem)) return false;
+    if (!SafeReadU32(hmsItem + 0x34, &cCnt) || !SafeReadU32(hmsItem + 0x38, &cArr) ||
+        cCnt == 0 || !IsSafeWritableHeapAddr(cArr)) return false;
+    if (!SafeReadU32(cArr, &corp0) || !IsAnyHeapObject(corp0)) return false;
+    if (!SafeReadFloat(corp0 + 0x3C, &cx) || !SafeReadFloat(corp0 + 0x44, &cz)) return false;
+
+    Int3 bPos = ReadBlockCoord(blockAddr);
+    outDx = static_cast<int32_t>(std::lround(cx / 32.0f)) - bPos.x;
+    outDz = static_cast<int32_t>(std::lround(cz / 32.0f)) - bPos.z;
+    return true;
+}
+
+static bool ValidateDistinctTriplets(const std::vector<Int3>& pts) {
+    for (size_t i = 0; i < pts.size(); ++i) {
+        for (size_t j = i + 1; j < pts.size(); ++j) {
+            if (pts[i].x == pts[j].x && pts[i].y == pts[j].y && pts[i].z == pts[j].z) return false;
+        }
+    }
+    return true;
+}
+
+static void EnsureBlockUnitLayoutCalibrated() {
+    if (g_unitLayout.calibrated) return;
+    if (!g_ctx.pBlocksArray || g_ctx.blockCount == 0) return;
+
+    struct SampleBlk {
+        uintptr_t blk;
+        Int3      pos;
+        uint32_t  dir;
+        std::vector<uintptr_t> units;
+    };
+
+    std::vector<SampleBlk> samples;
+    std::vector<uint32_t>  seenInfos;
+
+    for (uint32_t i = 0; i < g_ctx.blockCount && samples.size() < 8; ++i) {
+        uint32_t b = 0, uCnt = 0, uArr = 0, bInfo = 0;
+        if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) || !IsAnyHeapObject(b)) continue;
+        if (!SafeReadU32(b + BLOCK_OFF_UNIT_CNT, &uCnt) || !SafeReadU32(b + BLOCK_OFF_UNIT_ARR, &uArr)) continue;
+        if (uCnt < 2 || uCnt > 128 || !IsSafeWritableHeapAddr(uArr)) continue;
+        if (!IsMovableTrackBlock(b)) continue;
+
+        SafeReadU32(b + BLOCK_OFF_BLOCKINFO, &bInfo);
+        if (bInfo != 0 && std::find(seenInfos.begin(), seenInfos.end(), bInfo) != seenInfos.end() && samples.size() >= 3) {
+            continue;
+        }
+
+        SampleBlk sb{};
+        sb.blk = b;
+        sb.pos = ReadBlockCoord(b);
+        sb.dir = ReadBlockDir(b);
+        bool allUnitsOk = true;
+        for (uint32_t u = 0; u < uCnt; ++u) {
+            uint32_t uPtr = 0;
+            if (!SafeReadU32(uArr + u * 4, &uPtr) || !IsAnyHeapObject(uPtr)) {
+                allUnitsOk = false;
+                break;
+            }
+            sb.units.push_back(uPtr);
+        }
+        if (allUnitsOk && sb.units.size() >= 2) {
+            samples.push_back(std::move(sb));
+            if (bInfo != 0) seenInfos.push_back(bInfo);
+        }
+    }
+
+    if (samples.empty()) return;
+
+    // 1. Bevorzugt: CGameCtnBlockUnit -> CGameCtnBlockUnitInfo* -> lokales nat3 Offset (dreht immer live mit Dir!)
+    int bestPtrOff = -1, bestInfoOff = -1, bestScore = -1;
+    for (int pOff = 0x14; pOff <= 0x3C; pOff += 4) {
+        uint32_t infoCand = 0;
+        if (!SafeReadU32(samples[0].units[0] + pOff, &infoCand) || !IsAnyHeapObject(infoCand)) continue;
+        const char* cn = GetHeapObjectClassName(infoCand);
+        if (!cn || !ClassContainsWord(cn, "BlockUnitInfo")) continue;
+
+        for (int iOff = 0x14; iOff <= 0x58; iOff += 4) {
+            bool allMatch = true;
+            int score = 0;
+            for (const auto& sb : samples) {
+                std::vector<Int3> pts;
+                pts.reserve(sb.units.size());
+                int32_t minX = 999, minY = 999, minZ = 999;
+                int32_t maxX = -1, maxY = -1, maxZ = -1;
+                for (uintptr_t uPtr : sb.units) {
+                    uint32_t uiPtr = 0, ux = 0, uy = 0, uz = 0;
+                    if (!SafeReadU32(uPtr + pOff, &uiPtr) || !IsAnyHeapObject(uiPtr) ||
+                        !SafeReadU32(uiPtr + iOff, &ux) || !SafeReadU32(uiPtr + iOff + 4, &uy) || !SafeReadU32(uiPtr + iOff + 8, &uz) ||
+                        ux > 24u || uy > 24u || uz > 24u) {
+                        allMatch = false;
+                        break;
+                    }
+                    int32_t ix = static_cast<int32_t>(ux), iy = static_cast<int32_t>(uy), iz = static_cast<int32_t>(uz);
+                    minX = MinI32(minX, ix); minY = MinI32(minY, iy); minZ = MinI32(minZ, iz);
+                    maxX = MaxI32(maxX, ix); maxY = MaxI32(maxY, iy); maxZ = MaxI32(maxZ, iz);
+                    pts.push_back({ ix, iy, iz });
+                }
+                if (!allMatch || minX != 0 || minZ != 0 || minY > 2 || !ValidateDistinctTriplets(pts)) {
+                    allMatch = false;
+                    break;
+                }
+                score += 10;
+                if ((maxX > 0) + (maxY > 0) + (maxZ > 0) >= 2) score += 15;
+
+                int32_t cdx = 0, cdz = 0;
+                if (ReadBlockCorpusGridCornerDelta(sb.blk, cdx, cdz)) {
+                    int32_t sizeX = maxX + 1, sizeZ = maxZ + 1;
+                    if (sb.dir == 1u && cdx == sizeZ) score += 50;
+                    if (sb.dir == 2u && cdx == sizeX && cdz == sizeZ) score += 50;
+                    if (sb.dir == 3u && cdz == sizeX) score += 50;
+                }
+            }
+            if (allMatch && score > bestScore) {
+                bestScore = score;
+                bestPtrOff = pOff;
+                bestInfoOff = iOff;
+            }
+        }
+    }
+
+    if (bestPtrOff >= 0 && bestInfoOff >= 0) {
+        g_unitLayout.calibrated = true;
+        g_unitLayout.mode = BlockUnitOffsetMode::UnitInfoLocalU32;
+        g_unitLayout.unitPtrOff = bestPtrOff;
+        g_unitLayout.dataOff = bestInfoOff;
+        return;
+    }
+
+    // 2. Fallback: Direktes absolutes oder relatives nat3 in CGameCtnBlockUnit
+    for (int uOff = 0x14; uOff <= 0x44; uOff += 4) {
+        bool allAbs = true, allRel = true;
+        int  corpusMatchRot = 0, corpusMatchLoc = 0;
+
+        for (const auto& sb : samples) {
+            std::vector<Int3> absPts, relPts;
+            int32_t aMinX = 9999, aMinY = 9999, aMinZ = 9999;
+            int32_t rMinX = 9999, rMinY = 9999, rMinZ = 9999;
+            int32_t rMaxX = -1, rMaxZ = -1;
+
+            for (uintptr_t uPtr : sb.units) {
+                uint32_t ux = 0, uy = 0, uz = 0;
+                if (!SafeReadU32(uPtr + uOff, &ux) || !SafeReadU32(uPtr + uOff + 4, &uy) || !SafeReadU32(uPtr + uOff + 8, &uz)) {
+                    allAbs = false; allRel = false; break;
+                }
+                int32_t ix = static_cast<int32_t>(ux), iy = static_cast<int32_t>(uy), iz = static_cast<int32_t>(uz);
+
+                if (allAbs) {
+                    if (ix < sb.pos.x || ix > sb.pos.x + 24 || iy < sb.pos.y || iy > sb.pos.y + 24 || iz < sb.pos.z || iz > sb.pos.z + 24) {
+                        allAbs = false;
+                    }
+                    else {
+                        aMinX = MinI32(aMinX, ix); aMinY = MinI32(aMinY, iy); aMinZ = MinI32(aMinZ, iz);
+                        absPts.push_back({ ix, iy, iz });
+                    }
+                }
+                if (allRel) {
+                    if (ux > 24u || uy > 24u || uz > 24u) {
+                        allRel = false;
+                    }
+                    else {
+                        rMinX = MinI32(rMinX, ix); rMinY = MinI32(rMinY, iy); rMinZ = MinI32(rMinZ, iz);
+                        rMaxX = MaxI32(rMaxX, ix); rMaxZ = MaxI32(rMaxZ, iz);
+                        relPts.push_back({ ix, iy, iz });
+                    }
+                }
+            }
+            if (allAbs && (aMinX != sb.pos.x || aMinZ != sb.pos.z || aMinY > sb.pos.y + 2 || !ValidateDistinctTriplets(absPts))) allAbs = false;
+            if (allRel && (rMinX != 0 || rMinZ != 0 || rMinY > 2 || !ValidateDistinctTriplets(relPts))) allRel = false;
+
+            if (allRel) {
+                int32_t cdx = 0, cdz = 0;
+                if (ReadBlockCorpusGridCornerDelta(sb.blk, cdx, cdz)) {
+                    int32_t sx = rMaxX + 1, sz = rMaxZ + 1;
+                    if (sb.dir == 1u) { if (cdx == sx) ++corpusMatchRot; if (cdx == sz) ++corpusMatchLoc; }
+                    if (sb.dir == 3u) { if (cdz == sz) ++corpusMatchRot; if (cdz == sx) ++corpusMatchLoc; }
+                }
+            }
+        }
+
+        if (allAbs) {
+            g_unitLayout.calibrated = true;
+            g_unitLayout.mode = BlockUnitOffsetMode::UnitAbsU32;
+            g_unitLayout.dataOff = uOff;
+            return;
+        }
+        if (allRel) {
+            g_unitLayout.calibrated = true;
+            g_unitLayout.mode = BlockUnitOffsetMode::UnitRelU32;
+            g_unitLayout.dataOff = uOff;
+            g_unitLayout.relAlreadyRotated = (corpusMatchRot >= corpusMatchLoc);
+            return;
+        }
+    }
+
+    // 3. Fallback: Gepackte uint8_t (x, y, z) in CGameCtnBlockUnit
+    for (int uOff = 0x14; uOff <= 0x44; ++uOff) {
+        bool allRelU8 = true;
+        for (const auto& sb : samples) {
+            std::vector<Int3> pts;
+            int32_t minX = 999, minY = 999, minZ = 999;
+            for (uintptr_t uPtr : sb.units) {
+                uint8_t bx = 0, by = 0, bz = 0;
+                if (!SafeReadByte(uPtr + uOff, &bx) || !SafeReadByte(uPtr + uOff + 1, &by) || !SafeReadByte(uPtr + uOff + 2, &bz) ||
+                    bx > 24 || by > 24 || bz > 24) {
+                    allRelU8 = false;
+                    break;
+                }
+                minX = MinI32(minX, bx); minY = MinI32(minY, by); minZ = MinI32(minZ, bz);
+                pts.push_back({ bx, by, bz });
+            }
+            if (!allRelU8 || minX != 0 || minZ != 0 || minY > 2 || !ValidateDistinctTriplets(pts)) {
+                allRelU8 = false;
+                break;
+            }
+        }
+        if (allRelU8) {
+            g_unitLayout.calibrated = true;
+            g_unitLayout.mode = BlockUnitOffsetMode::UnitRelU8;
+            g_unitLayout.dataOff = uOff;
+            g_unitLayout.relAlreadyRotated = true;
+            return;
+        }
+    }
+}
+
+// Liefert ALLE realen 3D-Gridzellen (X, Y, Z), die ein (ggf. mehrteiliger) Block belegt
+static void GetBlockOccupiedCells(uintptr_t blockAddr, std::vector<Int3>& outCells) {
+    outCells.clear();
+    if (!IsAnyHeapObject(blockAddr)) return;
+
+    Int3 bPos = ReadBlockCoord(blockAddr);
+    uint32_t uCnt = 0, uArr = 0;
+    if (!SafeReadU32(blockAddr + BLOCK_OFF_UNIT_CNT, &uCnt) ||
+        !SafeReadU32(blockAddr + BLOCK_OFF_UNIT_ARR, &uArr) ||
+        uCnt <= 1 || uCnt > 128 || !IsSafeWritableHeapAddr(uArr)) {
+        outCells.push_back(bPos);
+        return;
+    }
+
+    EnsureBlockUnitLayoutCalibrated();
+    if (!g_unitLayout.calibrated) {
+        outCells.push_back(bPos);
+        return;
+    }
+
+    uint32_t dir = ReadBlockDir(blockAddr);
+
+    if (g_unitLayout.mode == BlockUnitOffsetMode::UnitInfoLocalU32) {
+        std::vector<Int3> locals;
+        locals.reserve(uCnt);
+        int32_t maxLX = 0, maxLZ = 0;
+        for (uint32_t u = 0; u < uCnt; ++u) {
+            uint32_t uPtr = 0, uiPtr = 0, ux = 0, uy = 0, uz = 0;
+            if (!SafeReadU32(uArr + u * 4, &uPtr) || !IsAnyHeapObject(uPtr)) continue;
+            if (!SafeReadU32(uPtr + g_unitLayout.unitPtrOff, &uiPtr) || !IsAnyHeapObject(uiPtr)) continue;
+            if (!SafeReadU32(uiPtr + g_unitLayout.dataOff, &ux) ||
+                !SafeReadU32(uiPtr + g_unitLayout.dataOff + 4, &uy) ||
+                !SafeReadU32(uiPtr + g_unitLayout.dataOff + 8, &uz)) continue;
+            if (ux > 24u || uy > 24u || uz > 24u) continue;
+            int32_t lx = static_cast<int32_t>(ux), ly = static_cast<int32_t>(uy), lz = static_cast<int32_t>(uz);
+            if (lx > maxLX) maxLX = lx;
+            if (lz > maxLZ) maxLZ = lz;
+            locals.push_back({ lx, ly, lz });
+        }
+        int32_t sizeX = maxLX + 1, sizeZ = maxLZ + 1;
+        outCells.reserve(locals.size());
+        for (const Int3& lc : locals) {
+            int32_t rx = 0, ry = 0, rz = 0;
+            RotateLocalUnitOffset(lc.x, lc.y, lc.z, sizeX, sizeZ, dir, rx, ry, rz);
+            outCells.push_back({ bPos.x + rx, bPos.y + ry, bPos.z + rz });
+        }
+    }
+    else if (g_unitLayout.mode == BlockUnitOffsetMode::UnitAbsU32) {
+        outCells.reserve(uCnt);
+        for (uint32_t u = 0; u < uCnt; ++u) {
+            uint32_t uPtr = 0, ux = 0, uy = 0, uz = 0;
+            if (!SafeReadU32(uArr + u * 4, &uPtr) || !IsAnyHeapObject(uPtr)) continue;
+            if (!SafeReadU32(uPtr + g_unitLayout.dataOff, &ux) ||
+                !SafeReadU32(uPtr + g_unitLayout.dataOff + 4, &uy) ||
+                !SafeReadU32(uPtr + g_unitLayout.dataOff + 8, &uz)) continue;
+            int32_t ix = static_cast<int32_t>(ux), iy = static_cast<int32_t>(uy), iz = static_cast<int32_t>(uz);
+            if (std::abs(ix - bPos.x) <= 32 && std::abs(iy - bPos.y) <= 32 && std::abs(iz - bPos.z) <= 32) {
+                outCells.push_back({ ix, iy, iz });
+            }
+        }
+    }
+    else if (g_unitLayout.mode == BlockUnitOffsetMode::UnitRelU32 || g_unitLayout.mode == BlockUnitOffsetMode::UnitRelU8) {
+        std::vector<Int3> rels;
+        rels.reserve(uCnt);
+        int32_t maxRX = 0, maxRZ = 0;
+        for (uint32_t u = 0; u < uCnt; ++u) {
+            uint32_t uPtr = 0;
+            if (!SafeReadU32(uArr + u * 4, &uPtr) || !IsAnyHeapObject(uPtr)) continue;
+            int32_t rx = 0, ry = 0, rz = 0;
+            if (g_unitLayout.mode == BlockUnitOffsetMode::UnitRelU32) {
+                uint32_t ux = 0, uy = 0, uz = 0;
+                if (!SafeReadU32(uPtr + g_unitLayout.dataOff, &ux) ||
+                    !SafeReadU32(uPtr + g_unitLayout.dataOff + 4, &uy) ||
+                    !SafeReadU32(uPtr + g_unitLayout.dataOff + 8, &uz) ||
+                    ux > 24u || uy > 24u || uz > 24u) continue;
+                rx = static_cast<int32_t>(ux); ry = static_cast<int32_t>(uy); rz = static_cast<int32_t>(uz);
+            }
+            else {
+                uint8_t bx = 0, by = 0, bz = 0;
+                if (!SafeReadByte(uPtr + g_unitLayout.dataOff, &bx) ||
+                    !SafeReadByte(uPtr + g_unitLayout.dataOff + 1, &by) ||
+                    !SafeReadByte(uPtr + g_unitLayout.dataOff + 2, &bz) ||
+                    bx > 24 || by > 24 || bz > 24) continue;
+                rx = bx; ry = by; rz = bz;
+            }
+            if (rx > maxRX) maxRX = rx;
+            if (rz > maxRZ) maxRZ = rz;
+            rels.push_back({ rx, ry, rz });
+        }
+        int32_t sizeX = maxRX + 1, sizeZ = maxRZ + 1;
+        outCells.reserve(rels.size());
+        for (const Int3& rc : rels) {
+            int32_t fx = rc.x, fy = rc.y, fz = rc.z;
+            if (!g_unitLayout.relAlreadyRotated) {
+                RotateLocalUnitOffset(rc.x, rc.y, rc.z, sizeX, sizeZ, dir, fx, fy, fz);
+            }
+            outCells.push_back({ bPos.x + fx, bPos.y + fy, bPos.z + fz });
+        }
+    }
+
+    if (outCells.empty()) outCells.push_back(bPos);
 }
 
 static bool IsOrthonormalRotationMatrixAt(uintptr_t objAddr, int off) {
@@ -468,9 +873,13 @@ static bool IsOrthonormalRotationMatrixAt(uintptr_t objAddr, int off) {
 }
 
 static int MoveHmsCorpus(uintptr_t corpusAddr, float dxW, float dyW, float dzW) {
-    if (!IsAnyHeapObject(corpusAddr)) return 0;
-    const char* cn = GetHeapObjectClassName(corpusAddr);
-    if (cn && !ClassStartsWith(cn, "CHmsCorpus")) return 0;
+    uint32_t vt = 0;
+    if (!IsAnyHeapObject(corpusAddr, &vt)) return 0;
+    if (g_cachedHmsCorpusVTable == 0 || vt != g_cachedHmsCorpusVTable) {
+        const char* cn = GetHeapObjectClassName(corpusAddr);
+        if (cn && !ClassStartsWith(cn, "CHmsCorpus")) return 0;
+        if (cn && g_cachedHmsCorpusVTable == 0) g_cachedHmsCorpusVTable = vt;
+    }
 
     float oldCx = 0, oldCy = 0, oldCz = 0;
     if (IsOrthonormalRotationMatrixAt(corpusAddr, 0x18) &&
@@ -537,10 +946,10 @@ static void RotateBlockVisualsTargeted(uintptr_t blockAddr, uint32_t dir) {
     float r[9] = { 0 };
     r[4] = 1.0f;
     switch (d) {
-    case 0: r[0] = 1.0f; r[2] = 0.0f; r[6] = 0.0f; r[8] = 1.0f; break;
-    case 1: r[0] = 0.0f; r[2] = -1.0f; r[6] = 1.0f; r[8] = 0.0f; break;
-    case 2: r[0] = -1.0f; r[2] = 0.0f; r[6] = 0.0f; r[8] = -1.0f; break;
-    case 3: r[0] = 0.0f; r[2] = 1.0f; r[6] = -1.0f; r[8] = 0.0f; break;
+    case 0: r[0] = 1.0f;  r[2] = 0.0f;  r[6] = 0.0f;  r[8] = 1.0f;  break;
+    case 1: r[0] = 0.0f;  r[2] = -1.0f; r[6] = 1.0f;  r[8] = 0.0f;  break;
+    case 2: r[0] = -1.0f; r[2] = 0.0f;  r[6] = 0.0f;  r[8] = -1.0f; break;
+    case 3: r[0] = 0.0f;  r[2] = 1.0f;  r[6] = -1.0f; r[8] = 0.0f;  break;
     }
 
     float newCornerX = (d == 1u || d == 2u) ? 32.0f : 0.0f;
@@ -586,7 +995,7 @@ static void RotateBlockVisualsTargeted(uintptr_t blockAddr, uint32_t dir) {
 }
 
 // ============================================================================
-// 4. Cursor-Zugriff, Main-Thread Scene-Rebuild & Optische Hervorhebung
+// 4. Cursor Access, Main-Thread Scene Rebuild & Visual Highlighting
 // ============================================================================
 
 typedef void(__thiscall* FnEditorRebuildThiscall)(void* pEditor);
@@ -649,15 +1058,18 @@ static std::vector<ClonedSignVisualOverride> g_clonedSignOverrides;
 static void ApplyClonedSignVisualOverrideToBlock(const ClonedSignVisualOverride& ov) {
     if (!IsAnyHeapObject(ov.blockAddr)) return;
 
-    // 1. Flags60 (inkl. 0x8000 Skin-Bit) sicherstellen
     if (ov.flags60 != 0u) {
         uint32_t curFl60 = 0;
         if (SafeReadU32(ov.blockAddr + BLOCK_OFF_FLAGS60, &curFl60)) {
-            SafeWriteU32(ov.blockAddr + BLOCK_OFF_FLAGS60, (curFl60 & ~0x8FFFu) | (ov.flags60 & 0x8FFFu));
+            uint32_t newFl60 = (curFl60 & ~0xFFFFu) | (ov.flags60 & 0xFFFFu);
+            if (!IsAnyHeapObject(ov.pSkin)) newFl60 &= ~0x8000u;
+            Int3 curPos = ReadBlockCoord(ov.blockAddr);
+            if (curPos.y <= 1) newFl60 |= 0x1000u;
+            else               newFl60 &= ~0x1000u;
+            SafeWriteU32(ov.blockAddr + BLOCK_OFF_FLAGS60, newFl60);
         }
     }
 
-    // 2. Exakten CGameCtnBlockSkin (+0x20) des Quell-Schildes setzen
     if (IsAnyHeapObject(ov.pSkin)) {
         uint32_t curSkin = 0;
         if (SafeReadU32(ov.blockAddr + BLOCK_OFF_SKIN, &curSkin) && curSkin != ov.pSkin) {
@@ -669,7 +1081,6 @@ static void ApplyClonedSignVisualOverrideToBlock(const ClonedSignVisualOverride&
         }
     }
 
-    // 3. CPlugTree (CPlugSolid + 0x5C) UND gecachten Render-Pointer (CHmsCorpus + 0x4C) aktualisieren
     uint32_t dstMob = 0, dstHmsItem = 0, dstPlugSolid = 0;
     if (SafeReadU32(ov.blockAddr + BLOCK_OFF_MOBIL_1, &dstMob) && IsAnyHeapObject(dstMob) &&
         SafeReadU32(dstMob + 0x28, &dstHmsItem) && IsAnyHeapObject(dstHmsItem)) {
@@ -686,7 +1097,7 @@ static void ApplyClonedSignVisualOverrideToBlock(const ClonedSignVisualOverride&
             }
         }
 
-        if (ov.corpus4C != 0) {
+        if (ov.corpus4C != 0 && IsSafeWritableHeapAddr(ov.corpus4C)) {
             uint32_t cCnt = 0, cArr = 0, corp0 = 0;
             if (SafeReadU32(dstHmsItem + 0x34, &cCnt) && SafeReadU32(dstHmsItem + 0x38, &cArr) &&
                 cCnt > 0 && IsSafeWritableHeapAddr(cArr) &&
@@ -712,25 +1123,49 @@ static uint32_t                       g_lastSpawnedCount = 0;
 static Int3                     g_lastWorldCursorPos = { 15, 2, 15 };
 static bool                     g_centerBlueprintAtCursor = true;
 static std::vector<std::string> g_blueprintFiles;
+static bool                     g_hasBoxCorner1 = false;
+static Int3                     g_boxCorner1 = { 0, 1, 0 };
 
 static void RequestLiveEditorRebuild();
 
+static bool ReadBlockPrimaryCorpusY(uintptr_t blockAddr, float* outY) {
+    uint32_t mob = 0, hmsItem = 0, cCnt = 0, cArr = 0, corp0 = 0;
+    if (SafeReadU32(blockAddr + BLOCK_OFF_MOBIL_1, &mob) && IsAnyHeapObject(mob) &&
+        SafeReadU32(mob + 0x28, &hmsItem) && IsAnyHeapObject(hmsItem) &&
+        SafeReadU32(hmsItem + 0x34, &cCnt) && SafeReadU32(hmsItem + 0x38, &cArr) &&
+        cCnt > 0 && IsSafeWritableHeapAddr(cArr) &&
+        SafeReadU32(cArr, &corp0) && IsAnyHeapObject(corp0) &&
+        SafeReadFloat(corp0 + 0x40, outY)) {
+        return true;
+    }
+    return false;
+}
+
+// Synchronisiert CHmsCorpus.Y exakt auf (pos.y * 8.0f + desiredPulseY), damit sich +2m niemals aufaddieren!
+static bool SyncBlockVisualYToCoord(uintptr_t blockAddr, float desiredPulseY) {
+    if (!IsAnyHeapObject(blockAddr)) return false;
+    float curY = 0.0f;
+    if (!ReadBlockPrimaryCorpusY(blockAddr, &curY)) return false;
+
+    Int3 pos = ReadBlockCoord(blockAddr);
+    float expectedY = pos.y * 8.0f + desiredPulseY;
+    float diffY = expectedY - curY;
+    if (std::fabs(diffY) > 0.05f) {
+        return MoveBlockVisualsTargeted(blockAddr, 0.0f, diffY, 0.0f) > 0;
+    }
+    return true;
+}
+
 static void ApplyPulseToEntry(SelectedBlockEntry& entry) {
-    if (!g_cfg.visualHighlight || entry.appliedPulseY != 0.0f || !IsAnyHeapObject(entry.blockAddr)) return;
-    if (MoveBlockVisualsTargeted(entry.blockAddr, 0.0f, 2.0f, 0.0f) > 0) {
+    if (!g_cfg.visualHighlight || !IsAnyHeapObject(entry.blockAddr)) return;
+    if (SyncBlockVisualYToCoord(entry.blockAddr, 2.0f)) {
         entry.appliedPulseY = 2.0f;
     }
 }
 
-static void ApplyAllSelectionPulses() {
-    if (!g_cfg.visualHighlight) return;
-    for (auto& entry : g_selectedBlocks) ApplyPulseToEntry(entry);
-}
-
 static void RemovePulseFromEntry(SelectedBlockEntry& entry) {
-    if (entry.appliedPulseY == 0.0f) return;
     if (IsAnyHeapObject(entry.blockAddr)) {
-        MoveBlockVisualsTargeted(entry.blockAddr, 0.0f, -entry.appliedPulseY, 0.0f);
+        SyncBlockVisualYToCoord(entry.blockAddr, 0.0f);
     }
     entry.appliedPulseY = 0.0f;
 }
@@ -739,11 +1174,24 @@ static void RemoveAllSelectionPulses() {
     for (auto& entry : g_selectedBlocks) RemovePulseFromEntry(entry);
 }
 
+static void ApplyAllSelectionPulses() {
+    if (!g_cfg.visualHighlight || g_selectedBlocks.size() > 64) {
+        RemoveAllSelectionPulses();
+        return;
+    }
+    for (auto& entry : g_selectedBlocks) ApplyPulseToEntry(entry);
+}
 static void ClearSelectionWithRestore() {
     bool hadSelection = !g_selectedBlocks.empty();
     RemoveAllSelectionPulses();
     g_selectedBlocks.clear();
-    if (hadSelection) RequestLiveEditorRebuild();
+    g_hasBoxCorner1 = false;
+    g_useSingleBoundingBox = false;
+    if (hadSelection) {
+        g_needVt31Rebuild = true;
+        g_deferredVt31Tick = 0;
+        RequestLiveEditorRebuild();
+    }
 }
 
 static Int3 ReadCursorCoord() {
@@ -759,53 +1207,14 @@ static Int3 ReadCursorCoord() {
 
 static void WriteCursorCoord(const Int3& c) {
     if (!IsAnyHeapObject(g_ctx.pCursor)) return;
-    Int3 oldC = ReadCursorCoord();
     SafeWriteU32(g_ctx.pCursor + 0x14, static_cast<uint32_t>(c.x));
     SafeWriteU32(g_ctx.pCursor + 0x18, static_cast<uint32_t>(c.y));
     SafeWriteU32(g_ctx.pCursor + 0x1C, static_cast<uint32_t>(c.z));
-
-    float dxW = (c.x - oldC.x) * 32.0f;
-    float dyW = (c.y - oldC.y) * 8.0f;
-    float dzW = (c.z - oldC.z) * 32.0f;
-    if (std::fabs(dxW) > 0.1f || std::fabs(dyW) > 0.1f || std::fabs(dzW) > 0.1f) {
-        std::vector<uintptr_t> visited;
-        const int curMobilOffsets[] = { 0x40, 0x44, 0x48 };
-        for (int mOff : curMobilOffsets) {
-            uint32_t cMob = 0;
-            if (SafeReadU32(g_ctx.pCursor + mOff, &cMob) && IsAnyHeapObject(cMob)) {
-                MoveSingleSceneMobil(cMob, dxW, dyW, dzW, visited);
-            }
-        }
-    }
-}
-
-static void UpdateCursorBoxHighlightColor(bool hasSelection) {
-    if (!IsAnyHeapObject(g_ctx.pCursor)) return;
-    if (hasSelection) {
-        SafeWriteFloat(g_ctx.pCursor + 0x2C, 0.0f);
-        SafeWriteFloat(g_ctx.pCursor + 0x30, 0.85f);
-        SafeWriteFloat(g_ctx.pCursor + 0x34, 1.0f);
-        SafeWriteFloat(g_ctx.pCursor + 0x58, 0.0f);
-        SafeWriteFloat(g_ctx.pCursor + 0x5C, 0.85f);
-        SafeWriteFloat(g_ctx.pCursor + 0x60, 1.0f);
-    }
-    else {
-        SafeWriteFloat(g_ctx.pCursor + 0x2C, 0.17f);
-        SafeWriteFloat(g_ctx.pCursor + 0x30, 0.05f);
-        SafeWriteFloat(g_ctx.pCursor + 0x34, 0.05f);
-        SafeWriteFloat(g_ctx.pCursor + 0x58, 0.05f);
-        SafeWriteFloat(g_ctx.pCursor + 0x5C, 0.17f);
-        SafeWriteFloat(g_ctx.pCursor + 0x60, 0.05f);
-    }
 }
 
 static bool RefreshEditorContext() {
     InitExeBounds();
-    g_ctx.pEditorCat = 0;
-    g_ctx.pCursor = 0;
-    g_ctx.pChallenge = 0;
-    g_ctx.pBlocksArray = 0;
-    g_ctx.blockCount = 0;
+    DynamicEditorContext next{};
 
     const uintptr_t knownGlobals[] = {
         g_exeStart + RVA_APP_SINGLETON_1,
@@ -818,35 +1227,38 @@ static bool RefreshEditorContext() {
         if (SafeReadU32(gAddr, &appCand) && IsAnyHeapObject(appCand)) {
             const char* cn = GetHeapObjectClassName(appCand);
             if (cn && (ClassIsExact(cn, "CTrackMania") || ClassStartsWith(cn, "CGameCtnApp"))) {
-                g_ctx.pApp = appCand;
+                next.pApp = appCand;
                 g_cachedAppPtrAddr = gAddr;
                 break;
             }
         }
     }
-    if (!g_ctx.pApp) return false;
-
-    uint32_t ch198 = 0;
-    if (SafeReadU32(g_ctx.pApp + 0x198, &ch198) && IsAnyHeapObject(ch198)) {
-        g_ctx.pChallenge = ch198;
+    if (!next.pApp) {
+        g_ctx = next;
+        return false;
     }
 
-    if (g_ctx.pChallenge) {
+    uint32_t ch198 = 0;
+    if (SafeReadU32(next.pApp + 0x198, &ch198) && IsAnyHeapObject(ch198)) {
+        next.pChallenge = ch198;
+    }
+
+    if (next.pChallenge) {
         uint32_t cnt54 = 0, arr58 = 0;
-        if (SafeReadU32(g_ctx.pChallenge + 0x54, &cnt54) &&
-            SafeReadU32(g_ctx.pChallenge + 0x58, &arr58) &&
+        if (SafeReadU32(next.pChallenge + 0x54, &cnt54) &&
+            SafeReadU32(next.pChallenge + 0x58, &arr58) &&
             cnt54 > 0 && cnt54 <= 50000 && arr58 >= 0x10000 && (arr58 & 3) == 0) {
-            g_ctx.blockCount = cnt54;
-            g_ctx.pBlocksArray = arr58;
+            next.blockCount = cnt54;
+            next.pBlocksArray = arr58;
         }
     }
 
     uint32_t ed414 = 0;
-    if (SafeReadU32(g_ctx.pApp + 0x414, &ed414) && IsAnyHeapObject(ed414)) {
-        g_ctx.pEditorCat = ed414;
+    if (SafeReadU32(next.pApp + 0x414, &ed414) && IsAnyHeapObject(ed414)) {
+        next.pEditorCat = ed414;
         uint32_t curBC = 0;
         if (SafeReadU32(ed414 + 0xBC, &curBC) && IsAnyHeapObject(curBC)) {
-            g_ctx.pCursor = curBC;
+            next.pCursor = curBC;
         }
         else {
             for (int off = 0x10; off <= 0x200; off += 4) {
@@ -854,12 +1266,14 @@ static bool RefreshEditorContext() {
                 if (!SafeReadU32(ed414 + off, &field) || !IsAnyHeapObject(field)) continue;
                 const char* cn = GetHeapObjectClassName(field);
                 if (cn && ClassContainsWord(cn, "Cursor")) {
-                    g_ctx.pCursor = field;
+                    next.pCursor = field;
                     break;
                 }
             }
         }
     }
+
+    g_ctx = next;
     return (g_ctx.pChallenge != 0 && g_ctx.pBlocksArray != 0);
 }
 
@@ -964,7 +1378,7 @@ static void ExecuteEditorSceneRebuildNow() {
     if (RefreshEditorContext() && IsAnyHeapObject(g_ctx.pEditorCat)) {
         uint32_t edVt = 0;
         if (SafeReadU32(g_ctx.pEditorCat, &edVt) && edVt >= 0x10000) {
-            Int3 savedCursor = ReadCursorCoord();
+            bool didSpawnNew = false;
 
             if (!g_pendingSpawns.empty()) {
                 std::vector<PendingBlockSpawn> toSpawn;
@@ -974,13 +1388,28 @@ static void ExecuteEditorSceneRebuildNow() {
                 if (SafeReadU32(edVt + 68 * 4, &fnVt68) && fnVt68 >= 0x10000) {
                     RemoveAllSelectionPulses();
                     g_selectedBlocks.clear();
+                    g_useSingleBoundingBox = false;
                     uint32_t spawned = 0;
 
                     for (size_t sIdx = 0; sIdx < toSpawn.size(); ++sIdx) {
-                        const auto& sp = toSpawn[sIdx];
+                        PendingBlockSpawn sp = toSpawn[sIdx];
                         if (!IsAnyHeapObject(sp.pBlockInfo)) continue;
                         RefreshEditorContext();
                         uint32_t countBefore = g_ctx.blockCount;
+
+                        if (!IsAnyHeapObject(sp.pPlugTree) && g_ctx.pBlocksArray && countBefore > 0) {
+                            for (uint32_t bIdx = 0; bIdx < countBefore; ++bIdx) {
+                                uint32_t candB = 0, candInfo = 0, candFl60 = 0;
+                                if (!SafeReadU32(g_ctx.pBlocksArray + bIdx * 4, &candB) || !IsAnyHeapObject(candB)) continue;
+                                SafeReadU32(candB + BLOCK_OFF_BLOCKINFO, &candInfo);
+                                if (candInfo != sp.pBlockInfo) continue;
+                                SafeReadU32(candB + BLOCK_OFF_FLAGS60, &candFl60);
+                                if ((candFl60 & 0x403Fu) == (sp.flags60 & 0x403Fu)) {
+                                    sp.pPlugTree = ReadBlockPlugTree(candB);
+                                    if (IsAnyHeapObject(sp.pPlugTree)) break;
+                                }
+                            }
+                        }
 
                         uint32_t varArg = sp.flags60 & 0x3Fu;
                         uintptr_t res = 0;
@@ -1035,15 +1464,16 @@ static void ExecuteEditorSceneRebuildNow() {
                                 WriteBlockCoord(newBlk, sp.pos);
                                 WriteBlockDir(newBlk, sp.dir & 3u);
 
-                                // Falls das Quell-Schild einen Skin hatte, Override-Eintrag anlegen
-                                if (IsAnyHeapObject(sp.pSkin) || IsAnyHeapObject(sp.pPlugTree)) {
+                                if (IsAnyHeapObject(sp.pSkin) || IsAnyHeapObject(sp.pPlugTree) || (sp.flags60 & 0x403Fu) != 0u) {
                                     uint32_t srcCorpus4C = 0;
-                                    for (uint32_t bIdx = 0; bIdx < countBefore; ++bIdx) {
-                                        uint32_t candB = 0, candSkin = 0;
-                                        if (SafeReadU32(g_ctx.pBlocksArray + bIdx * 4, &candB) && candB != newBlk &&
-                                            SafeReadU32(candB + BLOCK_OFF_SKIN, &candSkin) && candSkin == sp.pSkin) {
-                                            srcCorpus4C = ReadBlockCorpus4C(candB);
-                                            break;
+                                    if (IsAnyHeapObject(sp.pSkin)) {
+                                        for (uint32_t bIdx = 0; bIdx < countBefore; ++bIdx) {
+                                            uint32_t candB = 0, candSkin = 0;
+                                            if (SafeReadU32(g_ctx.pBlocksArray + bIdx * 4, &candB) && candB != newBlk &&
+                                                SafeReadU32(candB + BLOCK_OFF_SKIN, &candSkin) && candSkin == sp.pSkin) {
+                                                srcCorpus4C = ReadBlockCorpus4C(candB);
+                                                break;
+                                            }
                                         }
                                     }
                                     ClonedSignVisualOverride ov = { newBlk, sp.pSkin, sp.pPlugTree, srcCorpus4C, sp.flags60 };
@@ -1054,7 +1484,10 @@ static void ExecuteEditorSceneRebuildNow() {
                                     if (sp.flags60 != 0u) {
                                         uint32_t curFl60 = 0;
                                         SafeReadU32(newBlk + BLOCK_OFF_FLAGS60, &curFl60);
-                                        SafeWriteU32(newBlk + BLOCK_OFF_FLAGS60, (curFl60 & ~0x8FFFu) | (sp.flags60 & 0x8FFFu));
+                                        uint32_t mergedFl = (curFl60 & ~0xFFFFu) | (sp.flags60 & 0xFFFFu);
+                                        if (sp.pos.y <= 1) mergedFl |= 0x1000u;
+                                        else               mergedFl &= ~0x1000u;
+                                        SafeWriteU32(newBlk + BLOCK_OFF_FLAGS60, mergedFl);
                                     }
                                     uint32_t unwantedSkin = 0;
                                     if (SafeReadU32(newBlk + BLOCK_OFF_SKIN, &unwantedSkin) && unwantedSkin != 0) {
@@ -1076,6 +1509,7 @@ static void ExecuteEditorSceneRebuildNow() {
                     }
 
                     g_lastSpawnedCount = spawned;
+                    didSpawnNew = (spawned > 0);
                     if (!g_selectedBlocks.empty()) {
                         g_state = ModState::Moving;
                         ApplyAllSelectionPulses();
@@ -1094,10 +1528,12 @@ static void ExecuteEditorSceneRebuildNow() {
 
             std::vector<uintptr_t> blocksToUpdate;
             blocksToUpdate.swap(g_dirtyBlocks);
-            for (const auto& item : g_selectedBlocks) {
-                if (IsAnyHeapObject(item.blockAddr) &&
-                    std::find(blocksToUpdate.begin(), blocksToUpdate.end(), item.blockAddr) == blocksToUpdate.end()) {
-                    blocksToUpdate.push_back(item.blockAddr);
+            if (g_selectedBlocks.size() <= 64) {
+                for (const auto& item : g_selectedBlocks) {
+                    if (IsAnyHeapObject(item.blockAddr) &&
+                        std::find(blocksToUpdate.begin(), blocksToUpdate.end(), item.blockAddr) == blocksToUpdate.end()) {
+                        blocksToUpdate.push_back(item.blockAddr);
+                    }
                 }
             }
             for (uintptr_t bAddr : blocksToUpdate) {
@@ -1105,14 +1541,46 @@ static void ExecuteEditorSceneRebuildNow() {
             }
             ++g_rebuildExecCount;
 
-            uint32_t fnVt31 = 0;
-            if (SafeReadU32(edVt + 31 * 4, &fnVt31) && fnVt31 >= 0x10000) {
-                CallEditorVTableRebuildSeh(g_ctx.pEditorCat, fnVt31);
-            }
+            if (g_needVt31Rebuild || didSpawnNew) {
+                bool deferHeavyRebuild = (!didSpawnNew && g_selectedBlocks.size() > 64 &&
+                    g_deferredVt31Tick != 0 && GetTickCount64() < g_deferredVt31Tick);
 
-            // Einmalig nach VT[31] sicherstellen, dass geklonte Schilder ihren Skin (+0x20) & CPlugTree (+0x5C) behalten
-            for (const auto& ov : g_clonedSignOverrides) {
-                ApplyClonedSignVisualOverrideToBlock(ov);
+                if (!deferHeavyRebuild) {
+                    g_needVt31Rebuild = false;
+                    g_deferredVt31Tick = 0;
+
+                    uint32_t fnVt31 = 0;
+                    if (SafeReadU32(edVt + 31 * 4, &fnVt31) && fnVt31 >= 0x10000) {
+                        CallEditorVTableRebuildSeh(g_ctx.pEditorCat, fnVt31);
+                    }
+
+                    for (const auto& ov : g_clonedSignOverrides) {
+                        ApplyClonedSignVisualOverrideToBlock(ov);
+                    }
+
+                    // Exakte Y-Synchronisation (verhindert jeglichen Höhen-Drift nach VT[31])
+                    if (g_cfg.visualHighlight && g_selectedBlocks.size() <= 64) {
+                        for (auto& item : g_selectedBlocks) {
+                            if (SyncBlockVisualYToCoord(item.blockAddr, 2.0f)) {
+                                item.appliedPulseY = 2.0f;
+                            }
+                            if (IsAnyHeapObject(item.blockAddr)) {
+                                RefreshBlockMobilsInScene3dMainThread(item.blockAddr);
+                            }
+                        }
+                    }
+                    else {
+                        for (auto& item : g_selectedBlocks) {
+                            item.appliedPulseY = 0.0f;
+                            if (didSpawnNew) {
+                                SyncBlockVisualYToCoord(item.blockAddr, 0.0f);
+                                if (IsAnyHeapObject(item.blockAddr)) {
+                                    RefreshBlockMobilsInScene3dMainThread(item.blockAddr);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if (IsAnyHeapObject(sampleBlock)) {
@@ -1120,9 +1588,6 @@ static void ExecuteEditorSceneRebuildNow() {
                 SafeReadU32(sampleBlock + BLOCK_OFF_MOBIL_1, &m1);
                 g_mobilAfterRebuild = m1;
             }
-
-            WriteCursorCoord(savedCursor);
-            UpdateCursorBoxHighlightColor(!g_selectedBlocks.empty());
         }
     }
 
@@ -1174,21 +1639,20 @@ static void RequestLiveEditorRebuild() {
 }
 
 // ============================================================================
-// 5. Auswahl-Verwaltung, Drag-Select, Blaupausen & Block-Operationen
+// 5. Selection Management, Blueprints & Block Operations
 // ============================================================================
 
-// 20-Byte Layout für 100% Binärkompatibilität mit bestehenden .tmgroup Dateien
 struct ClipboardBlockData {
     Int3      relativeCoord;
     uint32_t  dir;
-    uint32_t  blockInfoId;      // Block + 0x14 (MwId des Blocktyps)
-    uintptr_t blockInfoPtr;     // Block + 0x24 (CGameCtnBlockInfo*)
-    uint32_t  reservedFlags60;  // Block + 0x60 (VariantIndex + Flags)
+    uint32_t  blockInfoId;     // Block + 0x14
+    uintptr_t blockInfoPtr;    // Block + 0x24
+    uint32_t  reservedFlags60; // Block + 0x60
 };
 
 static std::vector<ClipboardBlockData> g_clipboard;
-static std::vector<uintptr_t>          g_clipboardSkins;     // Parallel-Array für CGameCtnBlockSkin* (+0x20)
-static std::vector<uintptr_t>          g_clipboardPlugTrees; // Parallel-Array für CPlugTree* (CPlugSolid+0x5C)
+static std::vector<uintptr_t>          g_clipboardSkins;
+static std::vector<uintptr_t>          g_clipboardPlugTrees;
 static std::string g_baseDir = ".\\";
 static std::string g_iniPath = ".\\BlockMover.ini";
 static bool        g_running = true;
@@ -1196,8 +1660,6 @@ static bool        g_running = true;
 static bool      g_dragActive = false;
 static bool      g_dragAddMode = true;
 static uintptr_t g_lastDragBlock = 0;
-static bool      g_hasBoxCorner1 = false;
-static Int3      g_boxCorner1 = { 0, 1, 0 };
 
 static D3DMATRIX g_candView{};
 static bool      g_hasCandView = false;
@@ -1205,8 +1667,33 @@ static D3DMATRIX g_d3dView{};
 static D3DMATRIX g_d3dProj{};
 static bool      g_d3dHas3DMatrices = false;
 
+static volatile LONG g_pendingBeepPacked = 0;
+static HANDLE        g_beepEvent = nullptr;
+
+static DWORD WINAPI AsyncBeepWorkerThread(LPVOID) {
+    while (g_running) {
+        if (g_beepEvent) WaitForSingleObject(g_beepEvent, 250);
+        LONG packed = InterlockedExchange(&g_pendingBeepPacked, 0);
+        if (packed != 0 && g_cfg.soundFeedback) {
+            DWORD freq = static_cast<DWORD>((packed >> 16) & 0xFFFF);
+            DWORD dur = static_cast<DWORD>(packed & 0xFFFF);
+            if (freq >= 37 && dur > 0) Beep(freq, dur);
+        }
+    }
+    return 0;
+}
+
 static void PlayBeepSound(DWORD freq, DWORD dur) {
-    if (g_cfg.soundFeedback) Beep(freq, dur);
+    if (!g_cfg.soundFeedback) return;
+    static bool s_started = false;
+    if (!s_started) {
+        s_started = true;
+        g_beepEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+        CreateThread(nullptr, 0, AsyncBeepWorkerThread, nullptr, 0, nullptr);
+    }
+    LONG packed = static_cast<LONG>(((freq & 0xFFFF) << 16) | (dur & 0xFFFF));
+    InterlockedExchange(&g_pendingBeepPacked, packed);
+    if (g_beepEvent) SetEvent(g_beepEvent);
 }
 
 static void RefreshBlueprintFileList() {
@@ -1242,9 +1729,9 @@ static void InitPaths(HMODULE hMod) {
 
 static void ApplyKeybindPreset(int presetId) {
     g_cfg.keyToggleMenu = VK_F3;
-    g_cfg.keyToggleModMode = VK_F6;
+    g_cfg.keyToggleModMode = VK_F4;
     g_cfg.keyBackToSelect = VK_BACK;
-    if (presetId == 0) { // Standard-Preset
+    if (presetId == 0) {
         g_cfg.keySelectBlock = 'E';
         g_cfg.keyConfirmSelection = VK_NUMPAD0;
         g_cfg.keyMoveNorth = 'W';
@@ -1259,7 +1746,7 @@ static void ApplyKeybindPreset(int presetId) {
         g_cfg.keyCloneAtCursor = 'L';
         g_cfg.keyPasteBlueprint = 'I';
     }
-    else { // Numpad-Alternative
+    else {
         g_cfg.keySelectBlock = 'F';
         g_cfg.keyConfirmSelection = VK_NUMPAD0;
         g_cfg.keyMoveNorth = VK_NUMPAD8;
@@ -1276,12 +1763,12 @@ static void ApplyKeybindPreset(int presetId) {
     }
 }
 
-static void CycleStepMultiplier() {
+static void CycleStepMultiplier(bool reverse = false) {
     const int presets[5] = { 1, 2, 4, 8, 16 };
     int next = 1;
     for (int i = 0; i < 5; ++i) {
         if (g_cfg.stepMultiplier == presets[i]) {
-            next = presets[(i + 1) % 5];
+            next = reverse ? presets[(i + 4) % 5] : presets[(i + 1) % 5];
             break;
         }
     }
@@ -1338,12 +1825,10 @@ static void LoadConfig() {
     const char* ini = g_iniPath.c_str();
     g_cfg.modEnabled = GetPrivateProfileIntA("BlockMover", "ModEnabled", 1, ini) != 0;
     g_cfg.language = ClampI32(GetPrivateProfileIntA("BlockMover", "Language", 1, ini), 0, 1);
-    g_cfg.ruleMode = GetPrivateProfileIntA("BlockMover", "RuleMode", 1, ini);
-    if (GetModuleHandleA("TMUnlimiter.dll") != nullptr) {
-        g_cfg.ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
-    }
+    g_cfg.ruleMode = ClampI32(GetPrivateProfileIntA("BlockMover", "RuleMode", 0, ini), 0, 1);
+
     g_cfg.cameraRelativeMove = GetPrivateProfileIntA("BlockMover", "CameraRelativeMove", 1, ini) != 0;
-    g_cfg.cursorFollowsMove = GetPrivateProfileIntA("BlockMover", "CursorFollowsMove", 1, ini) != 0;
+    g_cfg.cursorFollowsMove = GetPrivateProfileIntA("BlockMover", "CursorFollowsMove", 0, ini) != 0;
     g_cfg.rotateAsGroup = GetPrivateProfileIntA("BlockMover", "RotateAsGroup", 1, ini) != 0;
     g_cfg.soundFeedback = GetPrivateProfileIntA("BlockMover", "SoundFeedback", 1, ini) != 0;
     g_cfg.visualHighlight = GetPrivateProfileIntA("BlockMover", "VisualHighlight", 1, ini) != 0;
@@ -1352,19 +1837,40 @@ static void LoadConfig() {
     g_cfg.stepMultiplier = ClampI32(GetPrivateProfileIntA("BlockMover", "StepMultiplier", 1, ini), 1, 32);
     g_centerBlueprintAtCursor = GetPrivateProfileIntA("BlockMover", "CenterBlueprintAtCursor", 1, ini) != 0;
 
-    g_cfg.keyToggleMenu = GetPrivateProfileIntA("BlockMover", "KeyToggleMenu", VK_F3, ini);
-    g_cfg.keyToggleModMode = GetPrivateProfileIntA("BlockMover", "KeyToggleModMode", VK_F6, ini);
     g_cfg.keySelectBlock = GetPrivateProfileIntA("BlockMover", "KeySelectBlock", 'E', ini);
+    if (g_cfg.keySelectBlock <= 0) g_cfg.keySelectBlock = 'E';
+
+    g_cfg.keyToggleMenu = GetPrivateProfileIntA("BlockMover", "KeyToggleMenu", VK_F3, ini);
+    if (g_cfg.keyToggleMenu <= 0 || g_cfg.keyToggleMenu == g_cfg.keySelectBlock || g_cfg.keyToggleMenu == 'E') {
+        g_cfg.keyToggleMenu = VK_F3;
+        WritePrivateProfileStringA("BlockMover", "KeyToggleMenu", "114", ini);
+    }
+
+    g_cfg.keyToggleModMode = GetPrivateProfileIntA("BlockMover", "KeyToggleModMode", VK_F4, ini);
+    if (g_cfg.keyToggleModMode <= 0 || g_cfg.keyToggleModMode == g_cfg.keySelectBlock ||
+        (g_cfg.keyToggleModMode >= VK_F5 && g_cfg.keyToggleModMode <= VK_F7)) {
+        g_cfg.keyToggleModMode = VK_F4;
+    }
+
     g_cfg.keyConfirmSelection = GetPrivateProfileIntA("BlockMover", "KeyConfirmSelection", VK_NUMPAD0, ini);
     g_cfg.keyBackToSelect = GetPrivateProfileIntA("BlockMover", "KeyBackToSelect", VK_BACK, ini);
+
     g_cfg.keyMoveNorth = GetPrivateProfileIntA("BlockMover", "KeyMoveNorth", 'W', ini);
+    if (g_cfg.keyMoveNorth <= 0) g_cfg.keyMoveNorth = 'W';
     g_cfg.keyMoveSouth = GetPrivateProfileIntA("BlockMover", "KeyMoveSouth", 'V', ini);
+    if (g_cfg.keyMoveSouth <= 0) g_cfg.keyMoveSouth = 'V';
     g_cfg.keyMoveWest = GetPrivateProfileIntA("BlockMover", "KeyMoveWest", 'A', ini);
+    if (g_cfg.keyMoveWest <= 0) g_cfg.keyMoveWest = 'A';
     g_cfg.keyMoveEast = GetPrivateProfileIntA("BlockMover", "KeyMoveEast", 'D', ini);
+    if (g_cfg.keyMoveEast <= 0) g_cfg.keyMoveEast = 'D';
     g_cfg.keyMoveUp = GetPrivateProfileIntA("BlockMover", "KeyMoveUp", VK_PRIOR, ini);
+    if (g_cfg.keyMoveUp <= 0) g_cfg.keyMoveUp = VK_PRIOR;
     g_cfg.keyMoveDown = GetPrivateProfileIntA("BlockMover", "KeyMoveDown", VK_NEXT, ini);
+    if (g_cfg.keyMoveDown <= 0) g_cfg.keyMoveDown = VK_NEXT;
     g_cfg.keyRotateCW = GetPrivateProfileIntA("BlockMover", "KeyRotateCW", 'R', ini);
+    if (g_cfg.keyRotateCW <= 0) g_cfg.keyRotateCW = 'R';
     g_cfg.keyRotateCCW = GetPrivateProfileIntA("BlockMover", "KeyRotateCCW", 'Q', ini);
+    if (g_cfg.keyRotateCCW <= 0) g_cfg.keyRotateCCW = 'Q';
 
     g_cfg.keyTeleportToCursor = GetPrivateProfileIntA("BlockMover", "KeyTeleportToCursor", VK_NUMPAD5, ini);
     g_cfg.keyCloneAtCursor = GetPrivateProfileIntA("BlockMover", "KeyCloneAtCursor", 'L', ini);
@@ -1384,63 +1890,178 @@ static void SanitizeSelection() {
         g_selectedBlocks.clear();
         return;
     }
+    if (g_selectedBlocks.empty()) return;
+
+    std::vector<uint32_t> validBlocks;
+    validBlocks.reserve(g_ctx.blockCount);
+    for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
+        uint32_t b = 0;
+        if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && b >= 0x10000) {
+            validBlocks.push_back(b);
+        }
+    }
+    std::sort(validBlocks.begin(), validBlocks.end());
+
     g_selectedBlocks.erase(
-        std::remove_if(g_selectedBlocks.begin(), g_selectedBlocks.end(), [](const SelectedBlockEntry& sel) {
-            if (!IsAnyHeapObject(sel.blockAddr)) return true;
-            for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
-                uint32_t b = 0;
-                if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && b == sel.blockAddr) return false;
-            }
-            return true;
+        std::remove_if(g_selectedBlocks.begin(), g_selectedBlocks.end(), [&](const SelectedBlockEntry& sel) {
+            return !std::binary_search(validBlocks.begin(), validBlocks.end(), static_cast<uint32_t>(sel.blockAddr));
             }),
         g_selectedBlocks.end()
     );
 }
 
-static uintptr_t FindBlockAtOrNearCursor(const Int3& target) {
+static uintptr_t FindBlockAtOrNearCursor(const Int3& target, Int3* outHitCell = nullptr) {
     if (!g_ctx.pBlocksArray || g_ctx.blockCount == 0) return 0;
 
     uintptr_t exact3DMatch = 0;
+    Int3      exactHitCell = target;
     uintptr_t sameColumnNear = 0;
+    Int3      sameColNearCell = target;
     int32_t   bestColNearDist = 999999;
-    uintptr_t nearColumnBest = 0;
-    int32_t   bestNearScore = 999999;
     uintptr_t sameColumnAnyY = 0;
+    Int3      sameColAnyCell = target;
     int32_t   bestColAnyDist = 999999;
+    uintptr_t adjacentFallback = 0;
+    Int3      adjCell = target;
+    int32_t   bestAdjScore = 999999;
 
+    std::vector<Int3> cells;
     for (int32_t i = static_cast<int32_t>(g_ctx.blockCount) - 1; i >= 0; --i) {
         uint32_t block = 0;
-        if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &block) || !IsMovableTrackBlock(block)) continue;
+        if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &block) || block < 0x10000) continue;
 
-        Int3 pos = ReadBlockCoord(block);
-        int32_t distXZ = std::abs(pos.x - target.x) + std::abs(pos.z - target.z);
-        int32_t distY = std::abs(pos.y - target.y);
+        // Schneller Grobfilter (Ursprung ist immer minX/minY/minZ eines mehrteiligen Blocks)
+        Int3 origin = ReadBlockCoord(block);
+        if (target.x < origin.x - 1 || target.x > origin.x + 16) continue;
+        if (target.z < origin.z - 1 || target.z > origin.z + 16) continue;
+        if (!IsMovableTrackBlock(block)) continue;
 
-        if (distXZ == 0 && distY == 0) {
-            exact3DMatch = block;
-            break;
-        }
-        if (distXZ == 0 && distY <= 4 && distY < bestColNearDist) {
-            bestColNearDist = distY;
-            sameColumnNear = block;
-        }
-        if (distXZ <= 1 && distY <= 2) {
-            int32_t score = distXZ * 12 + distY;
-            if (score < bestNearScore) {
-                bestNearScore = score;
-                nearColumnBest = block;
+        GetBlockOccupiedCells(block, cells);
+        for (const Int3& pos : cells) {
+            int32_t distXZ = std::abs(pos.x - target.x) + std::abs(pos.z - target.z);
+            int32_t distY = std::abs(pos.y - target.y);
+
+            if (distXZ == 0 && distY == 0) {
+                exact3DMatch = block;
+                exactHitCell = pos;
+                break;
+            }
+            if (distXZ == 0 && distY <= 4 && distY < bestColNearDist) {
+                bestColNearDist = distY;
+                sameColumnNear = block;
+                sameColNearCell = pos;
+            }
+            if (distXZ == 0 && distY < bestColAnyDist) {
+                bestColAnyDist = distY;
+                sameColumnAnyY = block;
+                sameColAnyCell = pos;
+            }
+            if (distXZ == 1 && distY <= 1) {
+                int32_t score = distXZ * 10 + distY;
+                if (score < bestAdjScore) {
+                    bestAdjScore = score;
+                    adjacentFallback = block;
+                    adjCell = pos;
+                }
             }
         }
-        if (distXZ == 0 && distY < bestColAnyDist) {
-            bestColAnyDist = distY;
-            sameColumnAnyY = block;
+        if (exact3DMatch) break;
+    }
+
+    if (exact3DMatch) { if (outHitCell) *outHitCell = exactHitCell;    return exact3DMatch; }
+    if (sameColumnNear) { if (outHitCell) *outHitCell = sameColNearCell; return sameColumnNear; }
+    if (sameColumnAnyY) { if (outHitCell) *outHitCell = sameColAnyCell;  return sameColumnAnyY; }
+    if (adjacentFallback && outHitCell) *outHitCell = adjCell;
+    return adjacentFallback;
+}
+
+// Findet den Block an der Cursor-Zelle (inkl. aller Multi-Unit-Teile) sowie exakt dort geblockmixte Blöcke
+// Findet den Block an der Cursor-Zelle (inkl. Multi-Unit-Teilen, exakt geblockmixten Blöcken
+// sowie vollständig zusammenhängenden CGameCtnBlockInfoRectAsym-Strukturen)
+static void FindAllBlocksAtOrNearCursor(const Int3& target, std::vector<uintptr_t>& outBlocks) {
+    outBlocks.clear();
+    Int3 hitCell = target;
+    uintptr_t primary = FindBlockAtOrNearCursor(target, &hitCell);
+    if (!primary) return;
+
+    outBlocks.push_back(primary);
+
+    // 1. Falls es sich um ein CGameCtnBlockInfoRectAsym handelt (besteht aus einzelnen 1x1-Teilstücken),
+    //    alle direkt angrenzenden Teile derselben Struktur (6-Nachbarn) gemeinsam erfassen
+    uint32_t primInfo = 0, primSkin = 0;
+    SafeReadU32(primary + BLOCK_OFF_BLOCKINFO, &primInfo);
+    SafeReadU32(primary + BLOCK_OFF_SKIN, &primSkin);
+    uint32_t primDir = ReadBlockDir(primary);
+    const char* primBiName = IsAnyHeapObject(primInfo) ? GetHeapObjectClassName(primInfo) : nullptr;
+
+    if (primBiName && ClassContainsWord(primBiName, "BlockInfoRectAsym")) {
+        struct RectCand { uintptr_t addr; Int3 pos; uint32_t dir; uint32_t skin; bool visited; };
+        std::vector<RectCand> cands;
+        cands.reserve(64);
+
+        for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
+            uint32_t b = 0, bInfo = 0;
+            if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) || b < 0x10000) continue;
+            if (!SafeReadU32(b + BLOCK_OFF_BLOCKINFO, &bInfo) || bInfo != primInfo) continue;
+            if (!IsMovableTrackBlock(b)) continue;
+
+            uint32_t bSkin = 0;
+            SafeReadU32(b + BLOCK_OFF_SKIN, &bSkin);
+            cands.push_back({ b, ReadBlockCoord(b), ReadBlockDir(b), bSkin, (b == primary) });
+        }
+
+        std::vector<Int3> bfsQueue;
+        bfsQueue.push_back(ReadBlockCoord(primary));
+        for (size_t qHead = 0; qHead < bfsQueue.size() && outBlocks.size() < 256; ++qHead) {
+            Int3 curP = bfsQueue[qHead];
+            for (auto& rc : cands) {
+                if (rc.visited) continue;
+                int32_t dx = std::abs(rc.pos.x - curP.x);
+                int32_t dy = std::abs(rc.pos.y - curP.y);
+                int32_t dz = std::abs(rc.pos.z - curP.z);
+
+                bool isVerticalNeighbor = (dx == 0 && dz == 0 && dy == 1);
+                bool isSideNeighbor = (dy == 0 && (dx + dz) == 1);
+                if (!isVerticalNeighbor && !isSideNeighbor) continue;
+
+                // Vertikal direkt aufeinanderliegende Teile (z.B. oberstes Abschlussstück) immer mitnehmen,
+                // seitliche Nachbarn bei gleicher Richtung oder gleichem Skin
+                bool compatible = isVerticalNeighbor
+                    || (rc.dir == primDir)
+                    || (primSkin != 0 && rc.skin == primSkin);
+                if (!compatible) continue;
+
+                rc.visited = true;
+                outBlocks.push_back(rc.addr);
+                bfsQueue.push_back(rc.pos);
+            }
         }
     }
 
-    if (exact3DMatch)   return exact3DMatch;
-    if (sameColumnNear) return sameColumnNear;
-    if (nearColumnBest) return nearColumnBest;
-    return sameColumnAnyY;
+    // 2. Exakt in derselben Grid-Zelle (hitCell) geblockmixte Blöcke ebenfalls mitnehmen
+    std::vector<Int3> cells;
+    for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
+        uint32_t b = 0;
+        if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) || b < 0x10000) continue;
+        if (std::find(outBlocks.begin(), outBlocks.end(), b) != outBlocks.end()) continue;
+
+        Int3 origin = ReadBlockCoord(b);
+        if (hitCell.x < origin.x || hitCell.x > origin.x + 16 ||
+            hitCell.y < origin.y || hitCell.y > origin.y + 16 ||
+            hitCell.z < origin.z || hitCell.z > origin.z + 16) continue;
+        if (!IsMovableTrackBlock(b)) continue;
+
+        GetBlockOccupiedCells(b, cells);
+        for (const Int3& pos : cells) {
+            if (pos.x == hitCell.x && pos.y == hitCell.y && pos.z == hitCell.z) {
+                outBlocks.push_back(b);
+                break;
+            }
+        }
+    }
+
+    // Deterministische Reihenfolge, damit E-Drag bei derselben Struktur nicht flackert
+    std::sort(outBlocks.begin(), outBlocks.end());
 }
 
 static void SelectLastPlacedBlock() {
@@ -1451,6 +2072,7 @@ static void SelectLastPlacedBlock() {
     }
     RemoveAllSelectionPulses();
     g_selectedBlocks.clear();
+    g_useSingleBoundingBox = false;
     for (int32_t i = static_cast<int32_t>(g_ctx.blockCount) - 1; i >= 0; --i) {
         uint32_t b = 0;
         if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && IsMovableTrackBlock(b)) {
@@ -1479,6 +2101,7 @@ static void SelectAllMapBlocks() {
     }
     RemoveAllSelectionPulses();
     g_selectedBlocks.clear();
+    g_useSingleBoundingBox = true;
     for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
         uint32_t b = 0;
         if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && IsMovableTrackBlock(b)) {
@@ -1506,6 +2129,7 @@ static void SelectBlocksOnSameHeightY() {
 
     RemoveAllSelectionPulses();
     g_selectedBlocks.clear();
+    g_useSingleBoundingBox = true;
     for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
         uint32_t b = 0;
         if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && IsMovableTrackBlock(b)) {
@@ -1542,6 +2166,7 @@ static void SelectBlocksOfSameType() {
 
     RemoveAllSelectionPulses();
     g_selectedBlocks.clear();
+    g_useSingleBoundingBox = false;
     for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
         uint32_t b = 0, bInfo = 0;
         if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && IsMovableTrackBlock(b) &&
@@ -1580,6 +2205,7 @@ static void SelectBlocksInBoxToCursor() {
     }
     RemoveAllSelectionPulses();
     SanitizeSelection();
+    g_useSingleBoundingBox = true;
 
     Int3 c2 = ReadCursorCoord();
     if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = c2;
@@ -1598,6 +2224,7 @@ static void SelectBlocksInBoxToCursor() {
             }
         }
     }
+    g_hasBoxCorner1 = false; // Clear green box marker once area is selected
     if (!g_selectedBlocks.empty()) {
         g_state = ModState::Moving;
         ApplyAllSelectionPulses();
@@ -1613,81 +2240,121 @@ static void ToggleBlockAtCursor() {
         return;
     }
     SanitizeSelection();
+    g_useSingleBoundingBox = false;
 
     Int3 target = ReadCursorCoord();
     if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = target;
-    uintptr_t chosen = FindBlockAtOrNearCursor(target);
-    if (!chosen) {
+
+    std::vector<uintptr_t> mixedBlocks;
+    FindAllBlocksAtOrNearCursor(target, mixedBlocks);
+    if (mixedBlocks.empty()) {
         PlayBeepSound(300, 60);
         return;
     }
 
-    for (auto it = g_selectedBlocks.begin(); it != g_selectedBlocks.end(); ++it) {
-        if (it->blockAddr == chosen) {
-            RemovePulseFromEntry(*it);
-            g_selectedBlocks.erase(it);
-            RequestLiveEditorRebuild();
-            PlayBeepSound(500, 50);
-            return;
+    bool anyAlreadySelected = false;
+    for (uintptr_t b : mixedBlocks) {
+        if (IsBlockSelected(b)) {
+            anyAlreadySelected = true;
+            break;
         }
     }
 
-    g_selectedBlocks.push_back({ chosen, 0.0f });
-    ApplyPulseToEntry(g_selectedBlocks.back());
-    g_state = ModState::Moving;
-    if (g_cfg.cursorFollowsMove) {
-        Int3 bPos = ReadBlockCoord(chosen);
-        WriteCursorCoord(bPos);
-        g_lastWorldCursorPos = bPos;
+    if (anyAlreadySelected) {
+        for (uintptr_t b : mixedBlocks) {
+            for (auto it = g_selectedBlocks.begin(); it != g_selectedBlocks.end(); ++it) {
+                if (it->blockAddr == b) {
+                    RemovePulseFromEntry(*it);
+                    g_selectedBlocks.erase(it);
+                    break;
+                }
+            }
+        }
+        RequestLiveEditorRebuild();
+        PlayBeepSound(500, 50);
+        return;
     }
+
+    for (uintptr_t b : mixedBlocks) {
+        if (!IsBlockSelected(b)) {
+            g_selectedBlocks.push_back({ b, 0.0f });
+        }
+    }
+    ApplyAllSelectionPulses();
+    g_state = ModState::Moving;
     RequestLiveEditorRebuild();
     PlayBeepSound(950, 60);
 }
 
 static void HandleContinuousDragSelect(bool selectKeyDown) {
+    static Int3 s_lastDragCursor = { -999, -999, -999 };
     if (!selectKeyDown) {
         if (g_dragActive && !g_selectedBlocks.empty()) g_state = ModState::Moving;
         g_dragActive = false;
         g_lastDragBlock = 0;
+        s_lastDragCursor = { -999, -999, -999 };
         return;
     }
     ScopedStateLock lock;
     if (!RefreshEditorContext() || !g_ctx.pBlocksArray || g_ctx.blockCount == 0) return;
 
     Int3 cur = ReadCursorCoord();
-    uintptr_t block = FindBlockAtOrNearCursor(cur);
-    if (!block || block == g_lastDragBlock) return;
-    g_lastDragBlock = block;
+    if (g_dragActive && cur.x == s_lastDragCursor.x && cur.y == s_lastDragCursor.y && cur.z == s_lastDragCursor.z) {
+        return;
+    }
+    s_lastDragCursor = cur;
+
+    std::vector<uintptr_t> mixedBlocks;
+    FindAllBlocksAtOrNearCursor(cur, mixedBlocks);
+    if (mixedBlocks.empty() || mixedBlocks[0] == g_lastDragBlock) return;
+    g_lastDragBlock = mixedBlocks[0];
 
     SanitizeSelection();
+    g_useSingleBoundingBox = false;
 
-    bool alreadySelected = IsBlockSelected(block);
+    bool alreadySelected = false;
+    for (uintptr_t b : mixedBlocks) {
+        if (IsBlockSelected(b)) {
+            alreadySelected = true;
+            break;
+        }
+    }
+
     if (!g_dragActive) {
         g_dragActive = true;
         g_dragAddMode = !alreadySelected;
     }
 
-    if (g_dragAddMode && !alreadySelected) {
-        g_selectedBlocks.push_back({ block, 0.0f });
-        ApplyPulseToEntry(g_selectedBlocks.back());
-        g_state = ModState::Moving;
-        if (g_cfg.cursorFollowsMove && g_selectedBlocks.size() == 1) {
-            Int3 bPos = ReadBlockCoord(block);
-            WriteCursorCoord(bPos);
-            g_lastWorldCursorPos = bPos;
-        }
-        RequestLiveEditorRebuild();
-        PlayBeepSound(950, 25);
-    }
-    else if (!g_dragAddMode && alreadySelected) {
-        for (auto it = g_selectedBlocks.begin(); it != g_selectedBlocks.end(); ++it) {
-            if (it->blockAddr == block) {
-                RemovePulseFromEntry(*it);
-                g_selectedBlocks.erase(it);
-                RequestLiveEditorRebuild();
-                PlayBeepSound(500, 25);
-                break;
+    if (g_dragAddMode) {
+        bool addedAny = false;
+        for (uintptr_t b : mixedBlocks) {
+            if (!IsBlockSelected(b)) {
+                g_selectedBlocks.push_back({ b, 0.0f });
+                addedAny = true;
             }
+        }
+        if (addedAny) {
+            ApplyAllSelectionPulses();
+            g_state = ModState::Moving;
+            RequestLiveEditorRebuild();
+            PlayBeepSound(950, 25);
+        }
+    }
+    else {
+        bool removedAny = false;
+        for (uintptr_t b : mixedBlocks) {
+            for (auto it = g_selectedBlocks.begin(); it != g_selectedBlocks.end(); ++it) {
+                if (it->blockAddr == b) {
+                    RemovePulseFromEntry(*it);
+                    g_selectedBlocks.erase(it);
+                    removedAny = true;
+                    break;
+                }
+            }
+        }
+        if (removedAny) {
+            RequestLiveEditorRebuild();
+            PlayBeepSound(500, 25);
         }
     }
 }
@@ -1760,7 +2427,7 @@ static void LoadBlueprintFromFile(const std::string& groupName) {
         g_clipboard.resize(count);
         g_clipboardSkins.assign(count, 0);
         g_clipboardPlugTrees.assign(count, 0);
-        if (rem == static_cast<std::streamsize>(count * sizeof(ClipboardBlockData))) {
+        if (rem >= static_cast<std::streamsize>(count * sizeof(ClipboardBlockData))) {
             file.read(reinterpret_cast<char*>(g_clipboard.data()), count * sizeof(ClipboardBlockData));
         }
         else if (rem == static_cast<std::streamsize>(count * 16)) {
@@ -1813,15 +2480,11 @@ static void PasteFormationToSelection() {
     SanitizeSelection();
     if (g_clipboard.empty()) { PlayBeepSound(240, 80); return; }
 
-    // Immer live den echten Spiel-Cursor lesen (und g_lastWorldCursorPos aktualisieren)
     Int3 liveCur = ReadCursorCoord();
     if (IsAnyHeapObject(g_ctx.pCursor)) {
         g_lastWorldCursorPos = liveCur;
     }
     Int3 targetOrigin = g_lastWorldCursorPos;
-    if (targetOrigin.x > 31 || targetOrigin.y > 31 || targetOrigin.z > 31) {
-        g_cfg.ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
-    }
 
     bool isVanilla = (g_cfg.ruleMode == static_cast<int>(BuildRuleMode::Vanilla));
     int32_t minX = isVanilla ? VANILLA_MIN_X : 0, maxX = isVanilla ? VANILLA_MAX_X : UNLIMITER_MAX;
@@ -1846,6 +2509,7 @@ static void PasteFormationToSelection() {
 
     RemoveAllSelectionPulses();
     g_pendingSpawns.clear();
+    g_useSingleBoundingBox = false;
 
     for (size_t i = 0; i < g_clipboard.size(); ++i) {
         uintptr_t bInfo = ResolveBlockInfoForClipboardEntry(g_clipboard[i]);
@@ -1874,15 +2538,8 @@ static void PasteFormationToSelection() {
 static void MoveSelectedBlocks(int32_t dirX, int32_t dirY, int32_t dirZ) {
     ScopedStateLock lock;
     if (!RefreshEditorContext()) return;
-    RemoveAllSelectionPulses();
     SanitizeSelection();
     if (g_selectedBlocks.empty()) { PlayBeepSound(240, 60); return; }
-
-    // Falls Cursor oder ein Block bereits außerhalb von 0..31 liegt, automatisch TMUnlimiter-Grenzen (0..255) nutzen
-    Int3 curCheck = ReadCursorCoord();
-    if (curCheck.x > 31 || curCheck.y > 31 || curCheck.z > 31) {
-        g_cfg.ruleMode = static_cast<int>(BuildRuleMode::TMUnlimiter);
-    }
 
     bool isVanilla = (g_cfg.ruleMode == static_cast<int>(BuildRuleMode::Vanilla));
     int32_t minX = isVanilla ? VANILLA_MIN_X : 0, maxX = isVanilla ? VANILLA_MAX_X : UNLIMITER_MAX;
@@ -1893,35 +2550,46 @@ static void MoveSelectedBlocks(int32_t dirX, int32_t dirY, int32_t dirZ) {
     int32_t dy = dirY * g_cfg.stepMultiplier;
     int32_t dz = dirZ * g_cfg.stepMultiplier;
 
-    // 1. Zuerst prüfen, ob ALLE ausgewählten Blöcke innerhalb der Grenzen bleiben,
-    //    damit eine Formation am Rand niemals auseinandergerissen wird!
+    int32_t maxPosX = 999999, maxNegX = 999999;
+    int32_t maxPosY = 999999, maxNegY = 999999;
+    int32_t maxPosZ = 999999, maxNegZ = 999999;
+
+    std::vector<Int3> occCells;
     for (const auto& entry : g_selectedBlocks) {
-        Int3 oldPos = ReadBlockCoord(entry.blockAddr);
-        if (oldPos.x > 31 || oldPos.y > 31 || oldPos.z > 31) {
-            minX = 0; maxX = UNLIMITER_MAX;
-            minY = 1; maxY = UNLIMITER_MAX;
-            minZ = 0; maxZ = UNLIMITER_MAX;
-        }
-        if (oldPos.x + dx < minX || oldPos.x + dx > maxX ||
-            oldPos.y + dy < minY || oldPos.y + dy > maxY ||
-            oldPos.z + dz < minZ || oldPos.z + dz > maxZ) {
-            ApplyAllSelectionPulses();
-            PlayBeepSound(240, 80);
-            return;
+        GetBlockOccupiedCells(entry.blockAddr, occCells);
+        for (const Int3& p : occCells) {
+            maxPosX = MinI32(maxPosX, maxX - p.x);
+            maxNegX = MinI32(maxNegX, p.x - minX);
+            maxPosY = MinI32(maxPosY, maxY - p.y);
+            maxNegY = MinI32(maxNegY, p.y - minY);
+            maxPosZ = MinI32(maxPosZ, maxZ - p.z);
+            maxNegZ = MinI32(maxNegZ, p.z - minZ);
         }
     }
 
-    int totalVisualHits = 0;
-    int movedBlocksCount = 0;
+    int32_t effDx = (dx > 0) ? ClampI32(dx, 0, MaxI32(0, maxPosX))
+        : (dx < 0) ? -ClampI32(-dx, 0, MaxI32(0, maxNegX)) : 0;
+    int32_t effDy = (dy > 0) ? ClampI32(dy, 0, MaxI32(0, maxPosY))
+        : (dy < 0) ? -ClampI32(-dy, 0, MaxI32(0, maxNegY)) : 0;
+    int32_t effDz = (dz > 0) ? ClampI32(dz, 0, MaxI32(0, maxPosZ))
+        : (dz < 0) ? -ClampI32(-dz, 0, MaxI32(0, maxNegZ)) : 0;
 
-    // 2. Alle Blöcke synchron bewegen
+    if (effDx == 0 && effDy == 0 && effDz == 0) {
+        PlayBeepSound(240, 80);
+        return;
+    }
+
+    int totalVisualHits = 0;
+    float fDx = effDx * 32.0f;
+    float fDy = effDy * 8.0f;
+    float fDz = effDz * 32.0f;
+
     for (auto& entry : g_selectedBlocks) {
         uintptr_t block = entry.blockAddr;
         Int3 oldPos = ReadBlockCoord(block);
-        Int3 newPos = { oldPos.x + dx, oldPos.y + dy, oldPos.z + dz };
+        Int3 newPos = { oldPos.x + effDx, oldPos.y + effDy, oldPos.z + effDz };
         WriteBlockCoord(block, newPos);
-        totalVisualHits += MoveBlockVisualsTargeted(block, dx * 32.0f, dy * 8.0f, dz * 32.0f);
-        ++movedBlocksCount;
+        totalVisualHits += MoveBlockVisualsTargeted(block, fDx, fDy, fDz);
     }
 
     g_lastMovedFloats = totalVisualHits;
@@ -1932,21 +2600,18 @@ static void MoveSelectedBlocks(int32_t dirX, int32_t dirY, int32_t dirZ) {
         g_lastWorldCursorPos = c;
     }
 
-    ApplyAllSelectionPulses();
+    g_deferredVt31Tick = (g_selectedBlocks.size() > 64) ? (GetTickCount64() + 450) : 0;
     RequestLiveEditorRebuild();
     PlayBeepSound(880, 30);
 }
 
-// Berechnet Vorwärts/Rückwärts & Links/Rechts direkt aus der 3D-Bildschirmprojektion (cx / cw)
 static void MoveSelectedBlocksCameraRelative(int32_t forwardStep, int32_t rightStep, int32_t upStep) {
     int32_t dx = 0, dz = 0;
     if (g_cfg.cameraRelativeMove && g_d3dHas3DMatrices) {
-        // 1. Rechts-Vektor auf dem Monitor (Richtung, in der clip.x = vx * proj._11 wächst)
         float sRight = (g_d3dProj._11 >= 0.0f) ? 1.0f : -1.0f;
         float rx = g_d3dView._11 * sRight;
         float rz = g_d3dView._31 * sRight;
 
-        // 2. Vorwärts-Vektor in den Monitor hinein (Richtung, in der Tiefe clip.w = vz * proj._34 wächst)
         float sFwd = (g_d3dProj._34 >= 0.0f) ? 1.0f : -1.0f;
         float fx = g_d3dView._13 * sFwd;
         float fz = g_d3dView._33 * sFwd;
@@ -1963,7 +2628,6 @@ static void MoveSelectedBlocksCameraRelative(int32_t forwardStep, int32_t rightS
         dz = forwardStep * fwdDz + rightStep * rightDz;
     }
     else {
-        // Feste TMNF-Weltachsen: Vorwärts = +Z, Rechts = -X, Links = +X
         dx = -rightStep;
         dz = forwardStep;
     }
@@ -2017,6 +2681,20 @@ static void RotateSelectedBlocks(bool clockwise) {
     int32_t minZ = isVanilla ? VANILLA_MIN_Z : 0, maxZ = isVanilla ? VANILLA_MAX_Z : UNLIMITER_MAX;
     Int3 pivot = ReadBlockCoord(g_selectedBlocks[0].blockAddr);
 
+    if (g_cfg.rotateAsGroup && g_selectedBlocks.size() > 1) {
+        for (const auto& entry : g_selectedBlocks) {
+            Int3 oldPos = ReadBlockCoord(entry.blockAddr);
+            int32_t relX = oldPos.x - pivot.x, relZ = oldPos.z - pivot.z;
+            int32_t nextX = clockwise ? (pivot.x - relZ) : (pivot.x + relZ);
+            int32_t nextZ = clockwise ? (pivot.z + relX) : (pivot.z - relX);
+            if (nextX < minX || nextX > maxX || nextZ < minZ || nextZ > maxZ) {
+                ApplyAllSelectionPulses();
+                PlayBeepSound(240, 80);
+                return;
+            }
+        }
+    }
+
     uint32_t dirStep = clockwise ? 1u : 3u;
     for (auto& entry : g_selectedBlocks) {
         uintptr_t block = entry.blockAddr;
@@ -2025,15 +2703,10 @@ static void RotateSelectedBlocks(bool clockwise) {
 
         if (g_cfg.rotateAsGroup && g_selectedBlocks.size() > 1) {
             int32_t relX = oldPos.x - pivot.x, relZ = oldPos.z - pivot.z;
-            // Synchron zur Block-Rotation (Dir 0 -> 1 -> 2 -> 3 entspricht +Z -> -X -> -Z -> +X)
-            int32_t nextX = clockwise ? (pivot.x - relZ) : (pivot.x + relZ);
-            int32_t nextZ = clockwise ? (pivot.z + relX) : (pivot.z - relX);
-            if (nextX >= minX && nextX <= maxX && nextZ >= minZ && nextZ <= maxZ) {
-                newPos.x = nextX;
-                newPos.z = nextZ;
-                WriteBlockCoord(block, newPos);
-                MoveBlockVisualsTargeted(block, (newPos.x - oldPos.x) * 32.0f, 0.0f, (newPos.z - oldPos.z) * 32.0f);
-            }
+            newPos.x = clockwise ? (pivot.x - relZ) : (pivot.x + relZ);
+            newPos.z = clockwise ? (pivot.z + relX) : (pivot.z - relX);
+            WriteBlockCoord(block, newPos);
+            MoveBlockVisualsTargeted(block, (newPos.x - oldPos.x) * 32.0f, 0.0f, (newPos.z - oldPos.z) * 32.0f);
         }
         WriteBlockDir(block, newDir);
         RotateBlockVisualsTargeted(block, newDir);
@@ -2079,45 +2752,8 @@ static void DumpDeepBlockVisualHierarchy(std::ofstream& out, uintptr_t blockAddr
     out << buf;
 
     DumpMemoryRangeToStream(out, "CGameCtnBlock", blockAddr, 0x68);
-
-    if (IsAnyHeapObject(skinPtr)) {
-        DumpMemoryRangeToStream(out, "CGameCtnBlockSkin (+0x20)", skinPtr, 0x40);
-    }
-
-    if (IsAnyHeapObject(mob0)) {
-        DumpMemoryRangeToStream(out, "CSceneMobil (+0x30)", mob0, 0x60);
-
-        uint32_t item20 = 0, hmsItem28 = 0;
-        if (SafeReadU32(mob0 + 0x20, &item20) && IsAnyHeapObject(item20)) {
-            DumpMemoryRangeToStream(out, "Mobil+0x20 Object", item20, 0x80);
-        }
-        if (SafeReadU32(mob0 + 0x28, &hmsItem28) && IsAnyHeapObject(hmsItem28)) {
-            DumpMemoryRangeToStream(out, "CHmsItem (Mobil+0x28)", hmsItem28, 0x80);
-
-            for (int off = 0x04; off < 0x60; off += 4) {
-                uint32_t subPtr = 0;
-                if (SafeReadU32(hmsItem28 + off, &subPtr) && IsAnyHeapObject(subPtr)) {
-                    char subTitle[64];
-                    sprintf_s(subTitle, "CHmsItem+0x%02X (%s)", off,
-                        GetHeapObjectClassName(subPtr) ? GetHeapObjectClassName(subPtr) : "Obj");
-                    DumpMemoryRangeToStream(out, subTitle, subPtr, 0x60);
-                }
-            }
-
-            uint32_t cCnt = 0, cArr = 0;
-            if (SafeReadU32(hmsItem28 + 0x34, &cCnt) && SafeReadU32(hmsItem28 + 0x38, &cArr) &&
-                cCnt > 0 && cCnt <= 8 && IsSafeWritableHeapAddr(cArr)) {
-                for (uint32_t i = 0; i < cCnt; ++i) {
-                    uint32_t corp = 0;
-                    if (SafeReadU32(cArr + i * 4, &corp) && IsAnyHeapObject(corp)) {
-                        char cTitle[64];
-                        sprintf_s(cTitle, "CHmsCorpus[%u]", i);
-                        DumpMemoryRangeToStream(out, cTitle, corp, 0x80);
-                    }
-                }
-            }
-        }
-    }
+    if (IsAnyHeapObject(skinPtr)) DumpMemoryRangeToStream(out, "CGameCtnBlockSkin (+0x20)", skinPtr, 0x40);
+    if (IsAnyHeapObject(mob0)) DumpMemoryRangeToStream(out, "CSceneMobil (+0x30)", mob0, 0x60);
 }
 
 static void WriteDiagnosticFile() {
@@ -2141,49 +2777,15 @@ static void WriteDiagnosticFile() {
     sprintf_s(buf, "SelectedBlocks:       %u | LastMoved3DFloats: %d | LastSpawned: %u\n",
         (uint32_t)g_selectedBlocks.size(), g_lastMovedFloats, g_lastSpawnedCount); out << buf;
 
-    // 1. Dumpe den ausgewählten Block IMMER zuerst!
     if (!g_selectedBlocks.empty() && IsAnyHeapObject(g_selectedBlocks[0].blockAddr)) {
         DumpDeepBlockVisualHierarchy(out, g_selectedBlocks[0].blockAddr, "SELECTED-BLOCK [0]");
     }
-
-    // 2. Dumpe die neuesten Skin-Blöcke RÜCKWÄRTS (vom Ende des Arrays abwärts, damit der Klon ganz oben steht!)
-    if (g_ctx.pBlocksArray && g_ctx.blockCount > 0) {
-        int skinBlockIdx = 0;
-        for (int32_t i = static_cast<int32_t>(g_ctx.blockCount) - 1; i >= 0 && skinBlockIdx < 4; --i) {
-            uint32_t b = 0, sk = 0;
-            if (SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) && IsAnyHeapObject(b) &&
-                SafeReadU32(b + BLOCK_OFF_SKIN, &sk) && IsAnyHeapObject(sk)) {
-                char lbl[64];
-                sprintf_s(lbl, "LATEST-SKIN-BLOCK #%d (ArrayIdx=%d)", skinBlockIdx, i);
-                DumpDeepBlockVisualHierarchy(out, b, lbl);
-                ++skinBlockIdx;
-            }
-        }
-    }
-
-    // 3. Dumpe die CPlugTree-Struktur des neuesten Skin-Blocks und die SetSkin-Engine-Funktionen:
-    if (g_exeStart != 0) {
-        const uint32_t rvas[] = { 0x2FD400, 0x2FD4E0, 0x4A2FD0, 0x4DE290 };
-        for (uint32_t rva : rvas) {
-            uintptr_t fnStart = g_exeStart + rva;
-            sprintf_s(buf, "\n--- Exe Code @ RVA 0x%06X (0x%08X) ---\n  ", rva, (uint32_t)fnStart);
-            out << buf;
-            for (int k = 0; k < 128; ++k) {
-                uint8_t b = 0;
-                SafeReadByte(fnStart + k, &b);
-                sprintf_s(buf, "%02X ", b);
-                out << buf;
-                if ((k & 15) == 15) out << "\n  ";
-            }
-        }
-    }
-
     out.close();
     PlayBeepSound(1250, 100);
 }
 
 // ============================================================================
-// 6. Dear ImGui 1.93.0 Direct3D 9 In-Game Overlay & 3D Blaue Boxen
+// 6. Dear ImGui 1.93.0 Direct3D 9 Overlay & Crash-Safe Rendering
 // ============================================================================
 
 static int* g_bindingTarget = nullptr;
@@ -2240,8 +2842,11 @@ static HookedD3DVTableEntry g_hookedVTables[16] = {};
 static bool                 g_imguiInitialized = false;
 static IDirect3DDevice9* g_imguiDevice = nullptr;
 static HWND                 g_imguiHwnd = nullptr;
-static char                 g_bpNameBuf[64] = "MeineDeko";
+static char                 g_bpNameBuf[64] = "MyBlueprint";
 static bool                 g_imguiWantKeyboard = false;
+static volatile bool        g_deviceResetInProgress = false;
+static volatile bool        g_editorOverlayActive = false;
+
 
 static bool IsTypingInBlueprintBox() {
     return (g_menuVisible && g_imguiInitialized && g_imguiWantKeyboard);
@@ -2249,6 +2854,9 @@ static bool IsTypingInBlueprintBox() {
 
 static bool IsModActiveMoveKey(WPARAM vk) {
     if (!g_cfg.modEnabled || g_state == ModState::Inactive) return false;
+    if (!IsAnyHeapObject(g_ctx.pEditorCat) || !IsAnyHeapObject(g_ctx.pCursor) || !IsAnyHeapObject(g_ctx.pChallenge)) {
+        return false;
+    }
     int k = static_cast<int>(vk);
     if (k <= 0) return false;
     if (k == g_cfg.keySelectLastBuilt || k == g_cfg.keySelectAllBlocks ||
@@ -2267,19 +2875,27 @@ static bool IsModActiveMoveKey(WPARAM vk) {
 }
 
 static bool HandleD3D9OverlayWndProcMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE) {
+        g_dragActive = false;
+        g_lastDragBlock = 0;
+        return false;
+    }
+
+    if (!g_editorOverlayActive) return false;
+
     if ((msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) &&
-        !g_menuVisible && IsModActiveMoveKey(wParam)) {
+        !IsTypingInBlueprintBox() && IsModActiveMoveKey(wParam)) {
         return true;
     }
 
     if (!g_imguiInitialized) return false;
 
     LRESULT imguiRes = ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
-    if (!g_menuVisible) return false;
     if (imguiRes) return true;
 
     ImGuiIO& io = ImGui::GetIO();
     switch (msg) {
+    case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
     case WM_LBUTTONDBLCLK:
@@ -2298,7 +2914,7 @@ static bool HandleD3D9OverlayWndProcMessage(HWND hWnd, UINT msg, WPARAM wParam, 
     case WM_SYSKEYDOWN:
     case WM_SYSKEYUP:
     case WM_CHAR:
-        if (io.WantCaptureKeyboard || io.WantTextInput) return true;
+        if (g_menuVisible && io.WantTextInput) return true;
         break;
     default:
         break;
@@ -2309,54 +2925,51 @@ static bool HandleD3D9OverlayWndProcMessage(HWND hWnd, UINT msg, WPARAM wParam, 
 static void ApplyTrackManiaImGuiTheme() {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.ChildRounding = 4.0f;
-    style.FrameRounding = 4.0f;
-    style.PopupRounding = 4.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.TabRounding = 4.0f;
-    style.WindowBorderSize = 1.5f;
-    style.FrameBorderSize = 1.0f;
+    style.WindowRounding = 8.0f;
+    style.ChildRounding = 6.0f;
+    style.FrameRounding = 5.0f;
+    style.PopupRounding = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding = 5.0f;
+    style.WindowBorderSize = 1.2f;
+    style.FrameBorderSize = 0.0f;
     style.WindowPadding = ImVec2(12.0f, 10.0f);
-    style.FramePadding = ImVec2(7.0f, 4.0f);
-    style.ItemSpacing = ImVec2(7.0f, 5.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    style.ItemSpacing = ImVec2(6.0f, 6.0f);
 
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.10f, 0.14f, 0.95f);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.05f, 0.08f, 0.11f, 0.90f);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.11f, 0.16f, 0.96f);
-    colors[ImGuiCol_Border] = ImVec4(0.00f, 0.78f, 1.00f, 0.65f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.11f, 0.16f, 0.23f, 0.90f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.16f, 0.25f, 0.36f, 0.95f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.20f, 0.32f, 0.46f, 1.00f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.08f, 0.14f, 0.22f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.20f, 0.32f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.00f, 0.90f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.00f, 0.78f, 1.00f, 0.85f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.00f, 0.92f, 1.00f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.13f, 0.21f, 0.31f, 0.95f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.18f, 0.34f, 0.49f, 1.00f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.00f, 0.60f, 0.82f, 1.00f);
-    colors[ImGuiCol_Header] = ImVec4(0.13f, 0.24f, 0.36f, 0.90f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.18f, 0.35f, 0.52f, 0.95f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.00f, 0.62f, 0.85f, 1.00f);
-    colors[ImGuiCol_Separator] = ImVec4(0.20f, 0.32f, 0.45f, 0.75f);
-    colors[ImGuiCol_Tab] = ImVec4(0.11f, 0.18f, 0.27f, 0.95f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.18f, 0.36f, 0.54f, 1.00f);
-    colors[ImGuiCol_TabSelected] = ImVec4(0.00f, 0.52f, 0.74f, 1.00f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.10f, 0.14f, 0.94f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.06f, 0.08f, 0.11f, 0.85f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.09f, 0.12f, 0.17f, 0.96f);
+    colors[ImGuiCol_Border] = ImVec4(0.16f, 0.58f, 0.78f, 0.55f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.17f, 0.24f, 0.95f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.25f, 0.35f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.22f, 0.32f, 0.45f, 1.00f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.07f, 0.11f, 0.17f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.09f, 0.16f, 0.25f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.10f, 0.85f, 1.00f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.14f, 0.20f, 0.29f, 0.95f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.20f, 0.32f, 0.46f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.06f, 0.56f, 0.78f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.12f, 0.20f, 0.30f, 0.92f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.17f, 0.30f, 0.44f, 0.98f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.08f, 0.52f, 0.72f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.22f, 0.30f, 0.42f, 0.55f);
+    style.ScrollbarSize = 14.0f;
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.05f, 0.07f, 0.10f, 0.90f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.20f, 0.42f, 0.58f, 0.95f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.24f, 0.56f, 0.78f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.10f, 0.72f, 0.95f, 1.00f);
 }
 
 static bool IsMainStadiumCameraView(IDirect3DDevice9* pDevice, const D3DMATRIX* v) {
     if (!v) return false;
 
-    // 1. Muss eine gültige affine 3D-Matrix sein (_44 == 1, letzte Spalte _14.._34 == 0)
     if (std::fabs(v->_44 - 1.0f) > 0.01f ||
         std::fabs(v->_14) > 0.01f || std::fabs(v->_24) > 0.01f || std::fabs(v->_34) > 0.01f) {
         return false;
     }
 
-    // 2. Obere 3x3-Matrix muss orthonormal sein (Einheitslänge der Zeilen, keine Skalierung)
     float r0 = v->_11 * v->_11 + v->_12 * v->_12 + v->_13 * v->_13;
     float r1 = v->_21 * v->_21 + v->_22 * v->_22 + v->_23 * v->_23;
     float r2 = v->_31 * v->_31 + v->_32 * v->_32 + v->_33 * v->_33;
@@ -2364,14 +2977,11 @@ static bool IsMainStadiumCameraView(IDirect3DDevice9* pDevice, const D3DMATRIX* 
         return false;
     }
 
-    // 3. 2D-UI-Einheitsmatrix (_11=1, _22=1, _33=1 ohne 3D-Neigung) strikt ausschließen!
     bool isIdentityRot = (std::fabs(v->_11 - 1.0f) < 1e-3f &&
         std::fabs(v->_22 - 1.0f) < 1e-3f &&
         std::fabs(v->_33 - 1.0f) < 1e-3f);
     if (isIdentityRot) return false;
 
-    // 4. Weltposition der Kamera aus View-Matrix berechnen: CamPos = -T * R^T
-    //    Im Stadion liegt die Kamera im Bereich X/Z (distXZ > 60m), bei 3D-Katalog-Icons nahe (0,0,0).
     float camX = -(v->_41 * v->_11 + v->_42 * v->_12 + v->_43 * v->_13);
     float camY = -(v->_41 * v->_21 + v->_42 * v->_22 + v->_43 * v->_23);
     float camZ = -(v->_41 * v->_31 + v->_42 * v->_32 + v->_43 * v->_33);
@@ -2379,7 +2989,6 @@ static bool IsMainStadiumCameraView(IDirect3DDevice9* pDevice, const D3DMATRIX* 
         return false;
     }
 
-    // 5. Viewport muss das Hauptfenster sein (keine kleinen Icon-Viewports)
     if (pDevice) {
         D3DVIEWPORT9 vp{};
         if (SUCCEEDED(pDevice->GetViewport(&vp)) && (vp.Width < 400 || vp.Height < 300)) {
@@ -2410,6 +3019,49 @@ static bool ProjectWorldToScreen(float wx, float wy, float wz, const D3DMATRIX& 
     return true;
 }
 
+static bool ProjectWorldToClip(float wx, float wy, float wz, const D3DMATRIX& view, const D3DMATRIX& proj, float& outCx, float& outCy, float& outCw) {
+    float vx = wx * view._11 + wy * view._21 + wz * view._31 + view._41;
+    float vy = wx * view._12 + wy * view._22 + wz * view._32 + view._42;
+    float vz = wx * view._13 + wy * view._23 + wz * view._33 + view._43;
+    float vw = wx * view._14 + wy * view._24 + wz * view._34 + view._44;
+
+    outCx = vx * proj._11 + vy * proj._21 + vz * proj._31 + vw * proj._41;
+    outCy = vx * proj._12 + vy * proj._22 + vz * proj._32 + vw * proj._42;
+    outCw = vx * proj._14 + vy * proj._24 + vz * proj._34 + vw * proj._44;
+    return (outCw >= 0.1f);
+}
+
+static void DrawClipped3DLineOnImGui(ImDrawList* dl, const ImVec2& dispSize,
+    float ax, float ay, float az, float bx, float by, float bz, ImU32 lineCol, float thickness = 2.0f)
+{
+    float cxa, cya, cwa, cxb, cyb, cwb;
+    ProjectWorldToClip(ax, ay, az, g_d3dView, g_d3dProj, cxa, cya, cwa);
+    ProjectWorldToClip(bx, by, bz, g_d3dView, g_d3dProj, cxb, cyb, cwb);
+
+    constexpr float kNearW = 0.25f;
+    if (cwa < kNearW && cwb < kNearW) return;
+    if (cwa < kNearW) {
+        float t = (kNearW - cwa) / (cwb - cwa);
+        cxa += t * (cxb - cxa);
+        cya += t * (cyb - cya);
+        cwa = kNearW;
+    }
+    else if (cwb < kNearW) {
+        float t = (kNearW - cwb) / (cwa - cwb);
+        cxb += t * (cxa - cxb);
+        cyb += t * (cya - cyb);
+        cwb = kNearW;
+    }
+
+    float nxA = cxa / cwa, nyA = cya / cwa;
+    float nxB = cxb / cwb, nyB = cyb / cwb;
+    if (std::fabs(nxA) > 12.0f || std::fabs(nyA) > 12.0f || std::fabs(nxB) > 12.0f || std::fabs(nyB) > 12.0f) return;
+
+    ImVec2 sA((nxA * 0.5f + 0.5f) * dispSize.x, (0.5f - nyA * 0.5f) * dispSize.y);
+    ImVec2 sB((nxB * 0.5f + 0.5f) * dispSize.x, (0.5f - nyB * 0.5f) * dispSize.y);
+    dl->AddLine(sA, sB, lineCol, thickness);
+}
+
 static void DrawProjected3DBoxOnImGui(ImDrawList* dl, const ImVec2& dispSize, float x0, float y0, float z0, float x1, float y1, float z1, ImU32 lineCol, ImU32 fillCol) {
     const float corners3D[8][3] = {
         { x0, y0, z0 },{ x1, y0, z0 },{ x1, y0, z1 },{ x0, y0, z1 },
@@ -2422,7 +3074,6 @@ static void DrawProjected3DBoxOnImGui(ImDrawList* dl, const ImVec2& dispSize, fl
         ok[i] = ProjectWorldToScreen(corners3D[i][0], corners3D[i][1], corners3D[i][2], g_d3dView, g_d3dProj, dispSize, pts[i]);
         if (ok[i]) ++validCnt;
     }
-    if (validCnt < 2) return;
 
     if ((fillCol >> 24) != 0 && validCnt == 8) {
         const int faces[6][4] = {
@@ -2442,13 +3093,241 @@ static void DrawProjected3DBoxOnImGui(ImDrawList* dl, const ImVec2& dispSize, fl
     };
     for (int e = 0; e < 12; ++e) {
         int a = edges[e][0], b = edges[e][1];
-        if (ok[a] && ok[b]) dl->AddLine(pts[a], pts[b], lineCol, 2.0f);
+        DrawClipped3DLineOnImGui(dl, dispSize,
+            corners3D[a][0], corners3D[a][1], corners3D[a][2],
+            corners3D[b][0], corners3D[b][1], corners3D[b][2], lineCol, 2.0f);
+    }
+}
+
+struct ShellQuad3D {
+    float p[4][3];
+};
+
+struct ShellEdge3D {
+    float ax, ay, az;
+    float bx, by, bz;
+};
+
+struct SelectionGridCell {
+    int32_t x, y, z;
+    int32_t pulseKey;
+    float   pulseY;
+};
+
+static bool IsTrueSilhouetteMask(int m) {
+    // 0 = leer, 15 = innen, 3/12/5/10 = flache Wand (keine Kante zeichnen!)
+    return (m != 0 && m != 15 && m != 3 && m != 12 && m != 5 && m != 10);
+}
+
+static void BuildVoxelShellForPulseGroup(
+    const std::vector<Int3>& sortedCells, float pulseY,
+    std::vector<ShellQuad3D>& outQuads, std::vector<ShellEdge3D>& outEdges)
+{
+    auto cmpInt3 = [](const Int3& a, const Int3& b) {
+        if (a.y != b.y) return a.y < b.y;
+        if (a.z != b.z) return a.z < b.z;
+        return a.x < b.x;
+        };
+    auto hasCell = [&](int32_t x, int32_t y, int32_t z) -> bool {
+        Int3 k{ x, y, z };
+        return std::binary_search(sortedCells.begin(), sortedCells.end(), k, cmpInt3);
+        };
+
+    // 1. Nur nach außen sichtbare Flächen sammeln & pro Ebene zu großen Quads verschmelzen (keine Innenwände!)
+    struct PlaneCell { int32_t plane, u, v; };
+    std::vector<PlaneCell> faceBuckets[6];
+    for (const Int3& c : sortedCells) {
+        if (!hasCell(c.x, c.y - 1, c.z)) faceBuckets[0].push_back({ c.y,     c.x, c.z }); // -Y
+        if (!hasCell(c.x, c.y + 1, c.z)) faceBuckets[1].push_back({ c.y + 1, c.x, c.z }); // +Y
+        if (!hasCell(c.x, c.y, c.z - 1)) faceBuckets[2].push_back({ c.z,     c.x, c.y }); // -Z
+        if (!hasCell(c.x, c.y, c.z + 1)) faceBuckets[3].push_back({ c.z + 1, c.x, c.y }); // +Z
+        if (!hasCell(c.x - 1, c.y, c.z)) faceBuckets[4].push_back({ c.x,     c.z, c.y }); // -X
+        if (!hasCell(c.x + 1, c.y, c.z)) faceBuckets[5].push_back({ c.x + 1, c.z, c.y }); // +X
+    }
+
+    auto cmpPC = [](const PlaneCell& a, const PlaneCell& b) {
+        if (a.plane != b.plane) return a.plane < b.plane;
+        if (a.v != b.v) return a.v < b.v;
+        return a.u < b.u;
+        };
+
+    for (int f = 0; f < 6; ++f) {
+        auto& vec = faceBuckets[f];
+        if (vec.empty()) continue;
+        std::sort(vec.begin(), vec.end(), cmpPC);
+        std::vector<uint8_t> used(vec.size(), 0);
+
+        auto findUnused = [&](int32_t plane, int32_t u, int32_t v) -> int {
+            PlaneCell key{ plane, u, v };
+            auto it = std::lower_bound(vec.begin(), vec.end(), key, cmpPC);
+            if (it != vec.end() && it->plane == plane && it->u == u && it->v == v) {
+                int idx = static_cast<int>(it - vec.begin());
+                if (!used[idx]) return idx;
+            }
+            return -1;
+            };
+
+        for (size_t i = 0; i < vec.size(); ++i) {
+            if (used[i]) continue;
+            int32_t pl = vec[i].plane, u0 = vec[i].u, u1 = u0, v0 = vec[i].v, v1 = v0;
+            while (findUnused(pl, u1 + 1, v0) >= 0) ++u1;
+            while (true) {
+                bool okV = true;
+                for (int32_t u = u0; u <= u1; ++u) {
+                    if (findUnused(pl, u, v1 + 1) < 0) { okV = false; break; }
+                }
+                if (!okV) break;
+                ++v1;
+            }
+            for (int32_t v = v0; v <= v1; ++v) {
+                for (int32_t u = u0; u <= u1; ++u) {
+                    int idx = findUnused(pl, u, v);
+                    if (idx >= 0) used[idx] = 1;
+                }
+            }
+
+            ShellQuad3D q{};
+            if (f == 0 || f == 1) { // Y-Ebene: u=X, v=Z
+                float wy = pl * 8.0f + pulseY;
+                float x0 = u0 * 32.0f, x1 = (u1 + 1) * 32.0f;
+                float z0 = v0 * 32.0f, z1 = (v1 + 1) * 32.0f;
+                q.p[0][0] = x0; q.p[0][1] = wy; q.p[0][2] = z0;
+                q.p[1][0] = x1; q.p[1][1] = wy; q.p[1][2] = z0;
+                q.p[2][0] = x1; q.p[2][1] = wy; q.p[2][2] = z1;
+                q.p[3][0] = x0; q.p[3][1] = wy; q.p[3][2] = z1;
+            }
+            else if (f == 2 || f == 3) { // Z-Ebene: u=X, v=Y
+                float wz = pl * 32.0f;
+                float x0 = u0 * 32.0f, x1 = (u1 + 1) * 32.0f;
+                float y0 = v0 * 8.0f + pulseY, y1 = (v1 + 1) * 8.0f + pulseY;
+                q.p[0][0] = x0; q.p[0][1] = y0; q.p[0][2] = wz;
+                q.p[1][0] = x1; q.p[1][1] = y0; q.p[1][2] = wz;
+                q.p[2][0] = x1; q.p[2][1] = y1; q.p[2][2] = wz;
+                q.p[3][0] = x0; q.p[3][1] = y1; q.p[3][2] = wz;
+            }
+            else { // X-Ebene: u=Z, v=Y
+                float wx = pl * 32.0f;
+                float z0 = u0 * 32.0f, z1 = (u1 + 1) * 32.0f;
+                float y0 = v0 * 8.0f + pulseY, y1 = (v1 + 1) * 8.0f + pulseY;
+                q.p[0][0] = wx; q.p[0][1] = y0; q.p[0][2] = z0;
+                q.p[1][0] = wx; q.p[1][1] = y0; q.p[1][2] = z1;
+                q.p[2][0] = wx; q.p[2][1] = y1; q.p[2][2] = z1;
+                q.p[3][0] = wx; q.p[3][1] = y1; q.p[3][2] = z0;
+            }
+            outQuads.push_back(q);
+        }
+    }
+
+    // 2. Echte Außen- & Innen-Eckkanten (Silhouette/Crease) extrahieren & kollinear verschmelzen
+    std::vector<Int3> candX, candY, candZ;
+    candX.reserve(sortedCells.size() * 4);
+    candY.reserve(sortedCells.size() * 4);
+    candZ.reserve(sortedCells.size() * 4);
+
+    for (const Int3& c : sortedCells) {
+        candX.push_back({ c.x, c.y,     c.z });
+        candX.push_back({ c.x, c.y + 1, c.z });
+        candX.push_back({ c.x, c.y,     c.z + 1 });
+        candX.push_back({ c.x, c.y + 1, c.z + 1 });
+
+        candY.push_back({ c.x,     c.y, c.z });
+        candY.push_back({ c.x + 1, c.y, c.z });
+        candY.push_back({ c.x,     c.y, c.z + 1 });
+        candY.push_back({ c.x + 1, c.y, c.z + 1 });
+
+        candZ.push_back({ c.x,     c.y,     c.z });
+        candZ.push_back({ c.x + 1, c.y,     c.z });
+        candZ.push_back({ c.x,     c.y + 1, c.z });
+        candZ.push_back({ c.x + 1, c.y + 1, c.z });
+    }
+
+    auto eqInt3 = [](const Int3& a, const Int3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+
+    // X-Kanten (sortiert nach y, z, x)
+    std::sort(candX.begin(), candX.end(), cmpInt3);
+    candX.erase(std::unique(candX.begin(), candX.end(), eqInt3), candX.end());
+    std::vector<Int3> keepX;
+    for (const Int3& e : candX) {
+        int m = (hasCell(e.x, e.y - 1, e.z - 1) ? 1 : 0)
+            | (hasCell(e.x, e.y, e.z - 1) ? 2 : 0)
+            | (hasCell(e.x, e.y - 1, e.z) ? 4 : 0)
+            | (hasCell(e.x, e.y, e.z) ? 8 : 0);
+        if (IsTrueSilhouetteMask(m)) keepX.push_back(e);
+    }
+    for (size_t i = 0; i < keepX.size(); ) {
+        size_t j = i;
+        while (j + 1 < keepX.size() && keepX[j + 1].y == keepX[i].y && keepX[j + 1].z == keepX[i].z && keepX[j + 1].x == keepX[j].x + 1) ++j;
+        float wy = keepX[i].y * 8.0f + pulseY, wz = keepX[i].z * 32.0f;
+        outEdges.push_back({ keepX[i].x * 32.0f, wy, wz, (keepX[j].x + 1) * 32.0f, wy, wz });
+        i = j + 1;
+    }
+
+    // Y-Kanten (sortiert nach x, z, y)
+    auto cmpY = [](const Int3& a, const Int3& b) {
+        if (a.x != b.x) return a.x < b.x;
+        if (a.z != b.z) return a.z < b.z;
+        return a.y < b.y;
+        };
+    std::sort(candY.begin(), candY.end(), cmpY);
+    candY.erase(std::unique(candY.begin(), candY.end(), eqInt3), candY.end());
+    std::vector<Int3> keepY;
+    for (const Int3& e : candY) {
+        int m = (hasCell(e.x - 1, e.y, e.z - 1) ? 1 : 0)
+            | (hasCell(e.x, e.y, e.z - 1) ? 2 : 0)
+            | (hasCell(e.x - 1, e.y, e.z) ? 4 : 0)
+            | (hasCell(e.x, e.y, e.z) ? 8 : 0);
+        if (IsTrueSilhouetteMask(m)) keepY.push_back(e);
+    }
+    for (size_t i = 0; i < keepY.size(); ) {
+        size_t j = i;
+        while (j + 1 < keepY.size() && keepY[j + 1].x == keepY[i].x && keepY[j + 1].z == keepY[i].z && keepY[j + 1].y == keepY[j].y + 1) ++j;
+        float wx = keepY[i].x * 32.0f, wz = keepY[i].z * 32.0f;
+        outEdges.push_back({ wx, keepY[i].y * 8.0f + pulseY, wz, wx, (keepY[j].y + 1) * 8.0f + pulseY, wz });
+        i = j + 1;
+    }
+
+    // Z-Kanten (sortiert nach x, y, z)
+    auto cmpZ = [](const Int3& a, const Int3& b) {
+        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y) return a.y < b.y;
+        return a.z < b.z;
+        };
+    std::sort(candZ.begin(), candZ.end(), cmpZ);
+    candZ.erase(std::unique(candZ.begin(), candZ.end(), eqInt3), candZ.end());
+    std::vector<Int3> keepZ;
+    for (const Int3& e : candZ) {
+        int m = (hasCell(e.x - 1, e.y - 1, e.z) ? 1 : 0)
+            | (hasCell(e.x, e.y - 1, e.z) ? 2 : 0)
+            | (hasCell(e.x - 1, e.y, e.z) ? 4 : 0)
+            | (hasCell(e.x, e.y, e.z) ? 8 : 0);
+        if (IsTrueSilhouetteMask(m)) keepZ.push_back(e);
+    }
+    for (size_t i = 0; i < keepZ.size(); ) {
+        size_t j = i;
+        while (j + 1 < keepZ.size() && keepZ[j + 1].x == keepZ[i].x && keepZ[j + 1].y == keepZ[i].y && keepZ[j + 1].z == keepZ[j].z + 1) ++j;
+        float wx = keepZ[i].x * 32.0f, wy = keepZ[i].y * 8.0f + pulseY;
+        outEdges.push_back({ wx, wy, keepZ[i].z * 32.0f, wx, wy, (keepZ[j].z + 1) * 32.0f });
+        i = j + 1;
     }
 }
 
 static void RenderImGuiSelectionBoxes3D(IDirect3DDevice9* pDevice) {
+    static std::vector<ShellQuad3D> s_cachedQuads;
+    static std::vector<ShellEdge3D> s_cachedEdges;
+    static bool                     s_hasSingleBox = false;
+    static float                    s_singleBox[6] = {};
+    static uint64_t                 s_cachedSig = 0;
+    static bool                     s_cachedSingleMode = false;
+
     if (!g_cfg.modEnabled || !g_cfg.showBlueBoxes) return;
-    if (g_selectedBlocks.empty() && !g_hasBoxCorner1) return;
+
+    if (g_selectedBlocks.empty()) {
+        s_cachedQuads.clear();
+        s_cachedEdges.clear();
+        s_hasSingleBox = false;
+        s_cachedSig = 0;
+        if (!g_hasBoxCorner1) return;
+    }
 
     if (!g_d3dHas3DMatrices && pDevice) {
         D3DMATRIX v{}, p{};
@@ -2467,20 +3346,122 @@ static void RenderImGuiSelectionBoxes3D(IDirect3DDevice9* pDevice) {
     ImVec2 dispSize = ImGui::GetIO().DisplaySize;
     if (!bgList || dispSize.x <= 0.0f || dispSize.y <= 0.0f) return;
 
-    size_t maxBoxes = g_selectedBlocks.size();
-    if (maxBoxes > 256) maxBoxes = 256;
-    for (size_t i = 0; i < maxBoxes; ++i) {
-        const auto& entry = g_selectedBlocks[i];
-        if (!IsAnyHeapObject(entry.blockAddr)) continue;
-        Int3 pos = ReadBlockCoord(entry.blockAddr);
-        float x0 = pos.x * 32.0f - 0.10f;
-        float y0 = pos.y * 8.0f + entry.appliedPulseY - 0.10f;
-        float z0 = pos.z * 32.0f - 0.10f;
-        float x1 = (pos.x + 1) * 32.0f + 0.10f;
-        float y1 = (pos.y + 1) * 8.0f + entry.appliedPulseY + 0.10f;
-        float z1 = (pos.z + 1) * 32.0f + 0.10f;
-        DrawProjected3DBoxOnImGui(bgList, dispSize, x0, y0, z0, x1, y1, z1,
-            IM_COL32(0, 229, 255, 245), IM_COL32(0, 180, 255, 36));
+    if (!g_selectedBlocks.empty()) {
+        uint64_t sig = 14695981039346656037ULL;
+        auto mix = [&](uint64_t v) { sig ^= v; sig *= 1099511628211ULL; };
+        mix(static_cast<uint64_t>(g_selectedBlocks.size()));
+        mix(g_useSingleBoundingBox ? 1ULL : 0ULL);
+        mix(static_cast<uint64_t>(g_rebuildExecCount));
+        mix(static_cast<uint64_t>(g_mobilSceneUpdateCount));
+        for (const auto& entry : g_selectedBlocks) {
+            mix(static_cast<uint64_t>(entry.blockAddr));
+            mix(static_cast<uint64_t>(static_cast<int32_t>(std::lround(entry.appliedPulseY * 10.0f))));
+        }
+        Int3 pFirst = ReadBlockCoord(g_selectedBlocks.front().blockAddr);
+        Int3 pLast = ReadBlockCoord(g_selectedBlocks.back().blockAddr);
+        mix(static_cast<uint64_t>(pFirst.x) ^ (static_cast<uint64_t>(pFirst.y) << 16) ^ (static_cast<uint64_t>(pFirst.z) << 32));
+        mix(static_cast<uint64_t>(pLast.x) ^ (static_cast<uint64_t>(pLast.y) << 16) ^ (static_cast<uint64_t>(pLast.z) << 32));
+        mix(ReadBlockDir(g_selectedBlocks.front().blockAddr));
+
+        if (sig != s_cachedSig || s_cachedSingleMode != g_useSingleBoundingBox) {
+            s_cachedSig = sig;
+            s_cachedSingleMode = g_useSingleBoundingBox;
+            s_cachedQuads.clear();
+            s_cachedEdges.clear();
+            s_hasSingleBox = false;
+
+            std::vector<Int3> occCells;
+            if (g_useSingleBoundingBox) {
+                bool hasAny = false;
+                float minWX = 1e9f, minWY = 1e9f, minWZ = 1e9f;
+                float maxWX = -1e9f, maxWY = -1e9f, maxWZ = -1e9f;
+                for (const auto& entry : g_selectedBlocks) {
+                    if (!IsAnyHeapObject(entry.blockAddr)) continue;
+                    GetBlockOccupiedCells(entry.blockAddr, occCells);
+                    for (const Int3& pos : occCells) {
+                        float x0 = pos.x * 32.0f;
+                        float y0 = pos.y * 8.0f + entry.appliedPulseY;
+                        float z0 = pos.z * 32.0f;
+                        float x1 = (pos.x + 1) * 32.0f;
+                        float y1 = (pos.y + 1) * 8.0f + entry.appliedPulseY;
+                        float z1 = (pos.z + 1) * 32.0f;
+                        if (x0 < minWX) minWX = x0;
+                        if (y0 < minWY) minWY = y0;
+                        if (z0 < minWZ) minWZ = z0;
+                        if (x1 > maxWX) maxWX = x1;
+                        if (y1 > maxWY) maxWY = y1;
+                        if (z1 > maxWZ) maxWZ = z1;
+                        hasAny = true;
+                    }
+                }
+                if (hasAny) {
+                    s_hasSingleBox = true;
+                    s_singleBox[0] = minWX - 0.15f; s_singleBox[1] = minWY - 0.15f; s_singleBox[2] = minWZ - 0.15f;
+                    s_singleBox[3] = maxWX + 0.15f; s_singleBox[4] = maxWY + 0.15f; s_singleBox[5] = maxWZ + 0.15f;
+                }
+            }
+            else {
+                std::vector<SelectionGridCell> allCells;
+                allCells.reserve(g_selectedBlocks.size() * 2);
+                for (const auto& entry : g_selectedBlocks) {
+                    if (!IsAnyHeapObject(entry.blockAddr)) continue;
+                    GetBlockOccupiedCells(entry.blockAddr, occCells);
+                    int32_t pk = static_cast<int32_t>(std::lround(entry.appliedPulseY * 10.0f));
+                    for (const Int3& pos : occCells) {
+                        allCells.push_back({ pos.x, pos.y, pos.z, pk, entry.appliedPulseY });
+                    }
+                }
+
+                auto cmpCell = [](const SelectionGridCell& a, const SelectionGridCell& b) {
+                    if (a.pulseKey != b.pulseKey) return a.pulseKey < b.pulseKey;
+                    if (a.y != b.y) return a.y < b.y;
+                    if (a.z != b.z) return a.z < b.z;
+                    return a.x < b.x;
+                    };
+                std::sort(allCells.begin(), allCells.end(), cmpCell);
+                allCells.erase(std::unique(allCells.begin(), allCells.end(), [](const SelectionGridCell& a, const SelectionGridCell& b) {
+                    return a.x == b.x && a.y == b.y && a.z == b.z && a.pulseKey == b.pulseKey;
+                    }), allCells.end());
+
+                for (size_t i = 0; i < allCells.size(); ) {
+                    int32_t curPk = allCells[i].pulseKey;
+                    float   curPy = allCells[i].pulseY;
+                    std::vector<Int3> groupCells;
+                    while (i < allCells.size() && allCells[i].pulseKey == curPk) {
+                        groupCells.push_back({ allCells[i].x, allCells[i].y, allCells[i].z });
+                        ++i;
+                    }
+                    BuildVoxelShellForPulseGroup(groupCells, curPy, s_cachedQuads, s_cachedEdges);
+                }
+            }
+        }
+
+        if (s_cachedSingleMode && s_hasSingleBox) {
+            DrawProjected3DBoxOnImGui(bgList, dispSize,
+                s_singleBox[0], s_singleBox[1], s_singleBox[2],
+                s_singleBox[3], s_singleBox[4], s_singleBox[5],
+                IM_COL32(0, 229, 255, 245), IM_COL32(0, 180, 255, 18));
+        }
+        else {
+            ImU32 fillCol = IM_COL32(0, 180, 255, 28);
+            size_t maxQ = (s_cachedQuads.size() > 512) ? 512 : s_cachedQuads.size();
+            for (size_t i = 0; i < maxQ; ++i) {
+                const auto& q = s_cachedQuads[i];
+                ImVec2 s[4];
+                if (ProjectWorldToScreen(q.p[0][0], q.p[0][1], q.p[0][2], g_d3dView, g_d3dProj, dispSize, s[0]) &&
+                    ProjectWorldToScreen(q.p[1][0], q.p[1][1], q.p[1][2], g_d3dView, g_d3dProj, dispSize, s[1]) &&
+                    ProjectWorldToScreen(q.p[2][0], q.p[2][1], q.p[2][2], g_d3dView, g_d3dProj, dispSize, s[2]) &&
+                    ProjectWorldToScreen(q.p[3][0], q.p[3][1], q.p[3][2], g_d3dView, g_d3dProj, dispSize, s[3])) {
+                    bgList->AddQuadFilled(s[0], s[1], s[2], s[3], fillCol);
+                }
+            }
+            ImU32 lineCol = IM_COL32(0, 229, 255, 245);
+            size_t maxE = (s_cachedEdges.size() > 1024) ? 1024 : s_cachedEdges.size();
+            for (size_t i = 0; i < maxE; ++i) {
+                const auto& e = s_cachedEdges[i];
+                DrawClipped3DLineOnImGui(bgList, dispSize, e.ax, e.ay, e.az, e.bx, e.by, e.bz, lineCol, 2.0f);
+            }
+        }
     }
 
     if (g_hasBoxCorner1) {
@@ -2493,8 +3474,8 @@ static void RenderImGuiSelectionBoxes3D(IDirect3DDevice9* pDevice) {
 }
 
 static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
-    bool inEditor = (g_ctx.pEditorCat != 0 && g_ctx.pChallenge != 0);
-    if (!inEditor && !g_menuVisible) return;
+    bool inEditor = g_editorOverlayActive && (g_ctx.pEditorCat != 0 && g_ctx.pChallenge != 0 && g_ctx.pCursor != 0);
+    if (!inEditor) return;
 
     HWND hGame = g_hookedGameWnd;
     if (!hGame && pDevice) {
@@ -2524,7 +3505,6 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         ApplyTrackManiaImGuiTheme();
         ImGui_ImplWin32_Init(hGame);
         ImGui_ImplDX9_Init(pDevice);
@@ -2534,6 +3514,7 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
     }
 
     ImGuiIO& io = ImGui::GetIO();
+    // Only draw ImGui software cursor when the full studio panel is open (prevents double-cursor in editor)
     io.MouseDrawCursor = g_menuVisible;
 
     ImGui_ImplDX9_NewFrame();
@@ -2552,221 +3533,286 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
     if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
 
     ImGui::NewFrame();
-    g_imguiWantKeyboard = g_menuVisible && (io.WantCaptureKeyboard || io.WantTextInput);
+    g_imguiWantKeyboard = g_menuVisible && io.WantTextInput;
 
-    // Immer live mit dem echten Editor-Cursor synchronisieren, sobald dieser im Spiel bewegt wird
-    if (inEditor) {
-        static Int3 s_prevHwCursor = { -1, -1, -1 };
-        Int3 hwCur = ReadCursorCoord();
-        if (hwCur.x != s_prevHwCursor.x || hwCur.y != s_prevHwCursor.y || hwCur.z != s_prevHwCursor.z) {
-            g_lastWorldCursorPos = hwCur;
-            s_prevHwCursor = hwCur;
-        }
+    static Int3 s_prevHwCursor = { -1, -1, -1 };
+    Int3 hwCur = ReadCursorCoord();
+    if (hwCur.x != s_prevHwCursor.x || hwCur.y != s_prevHwCursor.y || hwCur.z != s_prevHwCursor.z) {
+        g_lastWorldCursorPos = hwCur;
+        s_prevHwCursor = hwCur;
     }
 
     RenderImGuiSelectionBoxes3D(pDevice);
 
-    Int3 curPos = g_lastWorldCursorPos;
-    const char* modeShort = !g_cfg.modEnabled ? TR("DEAKTIVIERT", "DISABLED") :
-        (g_state == ModState::Inactive) ? TR("PAUSIERT", "PAUSED") :
-        (!g_selectedBlocks.empty()) ? TR("BEWEGEN AKTIV", "MOVING ACTIVE") : TR("AUSWAHL BEREIT", "SELECT READY");
-
-    if (g_menuVisible && inEditor) {
-        ImGui::SetNextWindowPos(ImVec2(12.0f, 10.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.88f);
-        ImGuiWindowFlags hudFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+    // Clickable quick-toggle pill in the top-left corner so players don't need to memorize F3!
+    if (!g_menuVisible) {
+        ImGui::SetNextWindowPos(ImVec2(14.0f, 12.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.78f);
+        ImGuiWindowFlags pillFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
-        if (ImGui::Begin("##BlockMoverHUD", nullptr, hudFlags)) {
-            ImGui::TextColored(ImVec4(0.00f, 0.92f, 1.00f, 1.0f), "TMNF BlockMover Studio");
-            ImGui::SameLine();
-            ImGui::Text("| %s | %s: %u | Cursor: (%d, %d, %d) | %s: %dx | [%s] %s",
-                modeShort, TR("Auswahl", "Selected"), (uint32_t)g_selectedBlocks.size(),
-                curPos.x, curPos.y, curPos.z,
-                TR("Schritt", "Step"), g_cfg.stepMultiplier, GetKeyName(g_cfg.keyToggleMenu).c_str(), TR("Menü", "Menu"));
+        if (ImGui::Begin("##BlockMoverQuickPill", nullptr, pillFlags)) {
+            char pillLbl[64];
+            if (!g_cfg.modEnabled) {
+                sprintf_s(pillLbl, "BlockMover [OFF] (F3)##pill");
+            }
+            else if (!g_selectedBlocks.empty()) {
+                sprintf_s(pillLbl, "BlockMover [%zu sel] (F3)##pill", g_selectedBlocks.size());
+            }
+            else {
+                sprintf_s(pillLbl, "BlockMover (F3)##pill");
+            }
+            if (ImGui::SmallButton(pillLbl)) {
+                g_menuVisible = true;
+                g_lastWorldCursorPos = ReadCursorCoord();
+                RefreshBlueprintFileList();
+                PlayBeepSound(950, 45);
+            }
         }
         ImGui::End();
     }
+    else {
+        const size_t selCount = g_selectedBlocks.size();
+        const bool hasSelection = (selCount > 0);
+        Int3 curPos = g_lastWorldCursorPos;
 
-    if (g_menuVisible) {
-        ImGui::SetNextWindowPos(ImVec2(20.0f, 46.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(610.0f, 580.0f), ImGuiCond_FirstUseEver);
+        static bool   s_prevModEnabled = g_cfg.modEnabled;
+        static ImVec2 s_savedExpandedSize(495.0f, 650.0f);
 
-        bool open = g_menuVisible;
-        if (ImGui::Begin("TMNF BlockMover Studio - Live 3D Editor & Blueprint Suite (F3)###MainStudio", &open)) {
-            float topW = ImGui::GetContentRegionAvail().x;
-            if (inEditor) {
-                ImGui::TextColored(ImVec4(0.00f, 0.90f, 1.00f, 1.0f),
-                    TR("Map (%u Blöcke) | Ziel-Cursor: (%d, %d, %d) | Clipboard: %u",
-                        "Map (%u Blocks) | Target Cursor: (%d, %d, %d) | Clipboard: %u"),
-                    g_ctx.blockCount, curPos.x, curPos.y, curPos.z, (uint32_t)g_clipboard.size());
+        ImGui::SetNextWindowPos(ImVec2(18.0f, 18.0f), ImGuiCond_FirstUseEver);
+
+        ImGuiWindowFlags winFlags = 0;
+        if (!g_cfg.modEnabled) {
+            ImGui::SetNextWindowSizeConstraints(ImVec2(340.0f, 82.0f), ImVec2(900.0f, 180.0f));
+            winFlags = ImGuiWindowFlags_AlwaysAutoResize;
+        }
+        else {
+            ImGui::SetNextWindowSizeConstraints(ImVec2(450.0f, 340.0f), ImVec2(1050.0f, 980.0f));
+            winFlags = ImGuiWindowFlags_AlwaysVerticalScrollbar;
+            if (!s_prevModEnabled) {
+                ImGui::SetNextWindowSize(s_savedExpandedSize, ImGuiCond_Always);
             }
             else {
-                ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.25f, 1.0f),
-                    TR("Bitte zuerst eine Map im Streckeneditor öffnen!", "Please open a map in the track editor first!"));
+                ImGui::SetNextWindowSize(s_savedExpandedSize, ImGuiCond_FirstUseEver);
             }
-            ImGui::SameLine(topW - 88.0f);
-            if (ImGui::Button(g_cfg.language == 0 ? "DE -> EN" : "EN -> DE", ImVec2(88.0f, 22.0f))) {
+        }
+        s_prevModEnabled = g_cfg.modEnabled;
+
+        bool open = g_menuVisible;
+        if (ImGui::Begin("BlockMover Studio (F3)###MainStudio", &open, winFlags)) {
+            if (g_cfg.modEnabled) {
+                ImVec2 curWinSize = ImGui::GetWindowSize();
+                if (curWinSize.x >= 445.0f && curWinSize.y >= 335.0f) {
+                    s_savedExpandedSize = curWinSize;
+                }
+            }
+
+            float availW = ImGui::GetContentRegionAvail().x;
+            float halfW = (availW - 8.0f) * 0.5f;
+
+            // =================================================================
+            // MASTER SWITCH: "Enable Mod"
+            // =================================================================
+            if (ImGui::Checkbox(TR("Mod aktivieren###MasterSw", "Enable Mod###MasterSw"), &g_cfg.modEnabled)) {
+                if (!g_cfg.modEnabled) {
+                    ClearSelectionWithRestore();
+                }
+                else if (g_state == ModState::Inactive) {
+                    g_state = ModState::Selecting;
+                }
+                SaveConfig();
+            }
+
+            ImGui::SameLine();
+            if (!g_cfg.modEnabled) {
+                ImGui::TextDisabled("| OFF");
+            }
+            else if (hasSelection) {
+                ImGui::TextColored(ImVec4(0.10f, 0.90f, 1.00f, 1.0f), "| %zu %s | (%d,%d,%d)",
+                    selCount, TR("gew\xC3\xA4hlt", "selected"), curPos.x, curPos.y, curPos.z);
+            }
+            else {
+                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "| %s | (%d,%d,%d)",
+                    TR("Bereit [E]", "Ready [E]"), curPos.x, curPos.y, curPos.z);
+            }
+
+            float rightLangX = ImGui::GetCursorStartPos().x + availW - 48.0f;
+            if (rightLangX > ImGui::GetCursorPosX()) ImGui::SameLine(rightLangX);
+            if (ImGui::Button(g_cfg.language == 0 ? "EN###LangBtn" : "DE###LangBtn", ImVec2(48.0f, 22.0f))) {
                 g_cfg.language = (g_cfg.language == 0) ? 1 : 0;
                 SaveConfig();
             }
 
-            if (inEditor) {
-                ImGui::SetNextItemWidth(180.0f);
-                if (ImGui::InputInt3(TR("Ziel-Cursor (X,Y,Z)", "Target Cursor (X,Y,Z)"), &g_lastWorldCursorPos.x)) {
-                    g_lastWorldCursorPos.x = ClampI32(g_lastWorldCursorPos.x, 0, UNLIMITER_MAX);
-                    g_lastWorldCursorPos.y = ClampI32(g_lastWorldCursorPos.y, 1, UNLIMITER_MAX);
-                    g_lastWorldCursorPos.z = ClampI32(g_lastWorldCursorPos.z, 0, UNLIMITER_MAX);
-                    WriteCursorCoord(g_lastWorldCursorPos);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button(TR("Auf Auswahl[0]", "To Selection[0]")) && !g_selectedBlocks.empty()) {
-                    g_lastWorldCursorPos = ReadBlockCoord(g_selectedBlocks[0].blockAddr);
-                    WriteCursorCoord(g_lastWorldCursorPos);
-                }
+            if (!g_cfg.modEnabled) {
+                ImGui::Separator();
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextDisabled("%s", TR("Aktiviere 'Mod aktivieren', um Werkzeuge anzuzeigen.",
+                    "Check 'Enable Mod' above to reveal studio tools."));
+                ImGui::PopTextWrapPos();
             }
+            else {
+                ImGui::Separator();
 
-            ImGui::Separator();
+                // =============================================================
+                // 1. CONTROL
+                // =============================================================
+                if (ImGui::CollapsingHeader(TR("Steuerung###HdrControl", "Control###HdrControl"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const float gap = 6.0f;
+                    float rightColW = MaxI32(114, static_cast<int32_t>(availW * 0.25f)) * 1.0f;
+                    float leftPadW = availW - rightColW - 12.0f;
+                    float btnW = (leftPadW - 2.0f * gap) / 3.0f;
+                    float btnH = 28.0f;
 
-            if (ImGui::BeginTabBar("BlockMoverMainTabs")) {
-                if (ImGui::BeginTabItem(TR("1. Steuerung & Auswahl", "1. Controls & Selection"))) {
-                    float availW = ImGui::GetContentRegionAvail().x;
-                    float bw3 = (availW - 14.0f) / 3.0f;
+                    if (ImGui::Button(TR("90\xC2\xB0 Links###rotL", "CCW 90\xC2\xB0###rotL"), ImVec2(btnW, btnH))) RotateSelectedBlocks(false);
+                    ImGui::SameLine(0.0f, gap);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.27f, 0.40f, 1.0f));
+                    if (ImGui::Button(TR("Vorw\xC3\xA4rts###fwd", "Forward###fwd"), ImVec2(btnW, btnH))) MoveSelectedBlocksCameraRelative(1, 0, 0);
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine(0.0f, gap);
+                    if (ImGui::Button(TR("90\xC2\xB0 Rechts###rotR", "CW 90\xC2\xB0###rotR"), ImVec2(btnW, btnH))) RotateSelectedBlocks(true);
 
-                    ImGui::TextColored(ImVec4(0.00f, 0.88f, 1.00f, 1.0f), TR("Smart-Auswahl Werkzeuge", "Smart Selection Tools"));
-                    if (ImGui::Button(TR("Cursor-Block (+/-)", "Cursor Block (+/-)"), ImVec2(bw3, 26.0f))) ToggleBlockAtCursor();
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Letzter gebauter Block", "Last Placed Block"), ImVec2(bw3, 26.0f))) SelectLastPlacedBlock();
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Alle Streckenblöcke", "All Track Blocks"), ImVec2(bw3, 26.0f))) SelectAllMapBlocks();
+                    ImGui::SameLine(0.0f, 12.0f);
+                    if (ImGui::Button(TR("Hoch (+Y)###up", "Up (+Y)###up"), ImVec2(rightColW, btnH))) MoveSelectedBlocksCameraRelative(0, 0, 1);
 
-                    if (ImGui::Button(TR("Gleiche Y-Höhe wählen", "Same Y-Height"), ImVec2(bw3, 26.0f))) SelectBlocksOnSameHeightY();
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Gleicher Blocktyp", "Same Block Type"), ImVec2(bw3, 26.0f))) SelectBlocksOfSameType();
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Auswahl absetzen", "Deselect All"), ImVec2(bw3, 26.0f))) {
-                        ClearSelectionWithRestore();
-                        g_state = ModState::Selecting;
-                        PlayBeepSound(400, 60);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.27f, 0.40f, 1.0f));
+                    if (ImGui::Button(TR("Links###lft", "Left###lft"), ImVec2(btnW, btnH))) MoveSelectedBlocksCameraRelative(0, -1, 0);
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine(0.0f, gap);
+                    if (ImGui::Button(TR("Zum Cursor###cur", "To Cursor###cur"), ImVec2(btnW, btnH))) {
+                        Int3 liveTarget = ReadCursorCoord();
+                        if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = liveTarget;
+                        TeleportSelectedBlocksToTarget(g_lastWorldCursorPos);
                     }
+                    ImGui::SameLine(0.0f, gap);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.27f, 0.40f, 1.0f));
+                    if (ImGui::Button(TR("Rechts###rgt", "Right###rgt"), ImVec2(btnW, btnH))) MoveSelectedBlocksCameraRelative(0, 1, 0);
+                    ImGui::PopStyleColor();
 
-                    char c1Label[64];
-                    if (g_hasBoxCorner1) sprintf_s(c1Label, TR("Ecke 1: (%d,%d,%d)", "Corner 1: (%d,%d,%d)"), g_boxCorner1.x, g_boxCorner1.y, g_boxCorner1.z);
-                    else sprintf_s(c1Label, "%s", TR("1. Box-Ecke 1 am Cursor", "1. Set Box Corner 1"));
-                    if (ImGui::Button(c1Label, ImVec2(bw3 * 1.5f, 25.0f))) SetBoxCorner1AtCursor();
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("2. Bereich bis Cursor wählen", "2. Select Box to Cursor"), ImVec2(availW - bw3 * 1.5f - 7.0f, 25.0f))) {
-                        SelectBlocksInBoxToCursor();
-                    }
+                    ImGui::SameLine(0.0f, 12.0f);
+                    char stepBtnLbl[40];
+                    sprintf_s(stepBtnLbl, "%s: %dx###stp", TR("Schritt", "Step"), g_cfg.stepMultiplier);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.42f, 0.58f, 1.0f));
+                    if (ImGui::Button(stepBtnLbl, ImVec2(rightColW, btnH))) CycleStepMultiplier(false);
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) CycleStepMultiplier(true);
+                    ImGui::PopStyleColor();
 
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.00f, 0.88f, 1.00f, 1.0f), TR("Schrittweite:", "Step Size:"));
-                    ImGui::SameLine();
-                    const int stepPresets[5] = { 1, 2, 4, 8, 16 };
-                    for (int sp : stepPresets) {
-                        bool active = (g_cfg.stepMultiplier == sp);
-                        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.62f, 0.86f, 1.0f));
-                        char spLbl[16]; sprintf_s(spLbl, "%dx", sp);
-                        if (ImGui::Button(spLbl, ImVec2(38.0f, 22.0f))) g_cfg.stepMultiplier = sp;
-                        if (active) ImGui::PopStyleColor();
-                        ImGui::SameLine();
-                    }
-                    ImGui::NewLine();
+                    ImGui::Dummy(ImVec2(btnW, btnH));
+                    ImGui::SameLine(0.0f, gap);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.27f, 0.40f, 1.0f));
+                    if (ImGui::Button(TR("Zur\xC3\xBC""ck###bck", "Back###bck"), ImVec2(btnW, btnH))) MoveSelectedBlocksCameraRelative(-1, 0, 0);
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine(0.0f, gap);
+                    ImGui::Dummy(ImVec2(btnW, btnH));
 
-                    if (ImGui::BeginTable("DPadTable", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame)) {
-                        ImGui::TableNextColumn();
-                        ImGui::TextDisabled(g_cfg.cameraRelativeMove
-                            ? TR("D-Pad (Relativ zur Kamera)", "D-Pad (Camera-Relative)")
-                            : TR("D-Pad (Feste Weltachsen)", "D-Pad (Fixed World Axes)"));
-                        ImGui::Dummy(ImVec2(76.0f, 0.0f)); ImGui::SameLine();
-                        if (ImGui::Button(TR("Vor##dp", "Forward##dp"), ImVec2(84.0f, 28.0f))) MoveSelectedBlocksCameraRelative(1, 0, 0);
+                    ImGui::SameLine(0.0f, 12.0f);
+                    if (ImGui::Button(TR("Runter (-Y)###dn", "Down (-Y)###dn"), ImVec2(rightColW, btnH))) MoveSelectedBlocksCameraRelative(0, 0, -1);
 
-                        if (ImGui::Button(TR("Links##dp", "Left##dp"), ImVec2(80.0f, 28.0f))) MoveSelectedBlocksCameraRelative(0, -1, 0);
-                        ImGui::SameLine();
-                        if (ImGui::Button(TR("Zum Cursor!", "To Cursor!"), ImVec2(84.0f, 28.0f))) {
-                            Int3 liveTarget = ReadCursorCoord();
-                            if (IsAnyHeapObject(g_ctx.pCursor)) g_lastWorldCursorPos = liveTarget;
-                            TeleportSelectedBlocksToTarget(g_lastWorldCursorPos);
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::Button(TR("Rechts##dp", "Right##dp"), ImVec2(80.0f, 28.0f))) MoveSelectedBlocksCameraRelative(0, 1, 0);
-
-                        ImGui::Dummy(ImVec2(76.0f, 0.0f)); ImGui::SameLine();
-                        if (ImGui::Button(TR("Zurück##dp", "Back##dp"), ImVec2(84.0f, 28.0f))) MoveSelectedBlocksCameraRelative(-1, 0, 0);
-
-                        ImGui::TableNextColumn();
-                        ImGui::TextDisabled(TR("Höhe (Y) & 90° Drehung", "Height (Y) & 90° Rotation"));
-                        float colW = ImGui::GetContentRegionAvail().x;
-                        float halfCol = (colW - 7.0f) * 0.5f;
-                        if (ImGui::Button(TR("Hoch (+Y)", "Up (+Y)"), ImVec2(halfCol, 28.0f))) MoveSelectedBlocksCameraRelative(0, 0, 1);
-                        ImGui::SameLine();
-                        if (ImGui::Button(TR("Runter (-Y)", "Down (-Y)"), ImVec2(halfCol, 28.0f))) MoveSelectedBlocksCameraRelative(0, 0, -1);
-
-                        if (ImGui::Button(TR("90° Rechts", "90° CW"), ImVec2(halfCol, 28.0f))) RotateSelectedBlocks(true);
-                        ImGui::SameLine();
-                        if (ImGui::Button(TR("90° Links", "90° CCW"), ImVec2(halfCol, 28.0f))) RotateSelectedBlocks(false);
-
-                        if (ImGui::Button(TR("Auswahl am Cursor klonen", "Clone Selection at Cursor"), ImVec2(colW, 28.0f))) {
-                            CopySelectedBlocks();
-                            PasteFormationToSelection();
-                        }
-                        ImGui::EndTable();
-                    }
-
-                    ImGui::Separator();
-                    ImGui::Checkbox(TR("Bewegung relativ zur Kamera-Perspektive (Vor/Zurück/Links/Rechts)",
-                        "Move relative to Camera Perspective (Forward/Back/Left/Right)"), &g_cfg.cameraRelativeMove);
-                    if (ImGui::Checkbox(TR("Auswahl +2m schweben lassen", "Float Selection +2m"), &g_cfg.visualHighlight)) {
-                        if (g_cfg.visualHighlight) ApplyAllSelectionPulses();
-                        else RemoveAllSelectionPulses();
-                        RequestLiveEditorRebuild();
-                    }
-                    ImGui::SameLine(295.0f);
-                    ImGui::Checkbox(TR("Cursor folgt beim Bewegen", "Cursor Follows Move"), &g_cfg.cursorFollowsMove);
-                    ImGui::Checkbox(TR("Als Gruppe drehen (90°)", "Rotate as Group (90°)"), &g_cfg.rotateAsGroup);
-                    ImGui::SameLine(295.0f);
-                    ImGui::Checkbox(TR("3D-Auswahlboxen (Overlay)", "3D Selection Boxes"), &g_cfg.showBlueBoxes);
-                    ImGui::EndTabItem();
-                }
-
-                if (ImGui::BeginTabItem(TR("2. Blaupausen (.tmgroup)", "2. Blueprints (.tmgroup)"))) {
-                    float availW = ImGui::GetContentRegionAvail().x;
-                    ImGui::TextColored(ImVec4(0.00f, 0.88f, 1.00f, 1.0f),
-                        TR("Spawnt exakt am Ziel-Cursor (%d, %d, %d) inkl. Block-Variante & Schild-Skin",
-                            "Spawns strictly at Target Cursor (%d, %d, %d) preserving Variant & Sign Skin"),
-                        curPos.x, curPos.y, curPos.z);
-
-                    ImGui::Checkbox(TR("Horizontal (X/Z) am Cursor zentrieren (Aus = Exakt ab Block[0]-Anker)",
-                        "Center horizontally (X/Z) at Cursor (Off = Exact Block[0] Anchor)"), &g_centerBlueprintAtCursor);
-
-                    ImGui::SetNextItemWidth(240.0f);
-                    ImGui::InputText(TR("Name (.tmgroup)", "File (.tmgroup)"), g_bpNameBuf, sizeof(g_bpNameBuf));
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Ordner scannen", "Scan Folder"), ImVec2(120.0f, 0.0f))) RefreshBlueprintFileList();
-
-                    float bwBp = (availW - 14.0f) / 3.0f;
-                    if (ImGui::Button(TR("1. Auswahl speichern (Strg+C)", "1. Save Selection (Ctrl+C)"), ImVec2(bwBp, 28.0f))) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.46f, 0.64f, 1.0f));
+                    if (ImGui::Button(TR("Auswahl am Cursor klonen (L)###btnClone", "Clone Selection at Cursor (L)###btnClone"), ImVec2(availW, 26.0f))) {
                         CopySelectedBlocks();
-                        SaveBlueprintToFile(g_bpNameBuf);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("2. Datei laden", "2. Load File"), ImVec2(bwBp, 28.0f))) LoadBlueprintFromFile(g_bpNameBuf);
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("3. Am Cursor spawnen (Strg+V)", "3. Spawn at Cursor (Ctrl+V)"), ImVec2(bwBp, 28.0f))) {
                         PasteFormationToSelection();
                     }
+                    ImGui::PopStyleColor();
 
-                    ImGui::Separator();
-                    ImGui::BeginChild("BlueprintListChild", ImVec2(0, 210.0f), ImGuiChildFlags_Borders);
+                    if (ImGui::TreeNode(TR("Weitere Steuerungs-Optionen###NodeCtrlOpt", "More Control Options###NodeCtrlOpt"))) {
+                        ImGui::Checkbox(TR("Kamerarelativ bewegen###chkCam", "Camera-Relative Movement###chkCam"), &g_cfg.cameraRelativeMove);
+                        ImGui::Checkbox(TR("Als Gruppe drehen (90\xC2\xB0)###chkGrp", "Rotate Group Together###chkGrp"), &g_cfg.rotateAsGroup);
+                        ImGui::Checkbox(TR("Cursor folgt beim Bewegen###chkCur", "Cursor Follows Selection###chkCur"), &g_cfg.cursorFollowsMove);
+                        if (ImGui::Checkbox(TR("Auswahl +2m schweben lassen###chkFlt", "Float Highlight (+2m)###chkFlt"), &g_cfg.visualHighlight)) {
+                            if (g_cfg.visualHighlight) ApplyAllSelectionPulses();
+                            else RemoveAllSelectionPulses();
+                            RequestLiveEditorRebuild();
+                        }
+                        ImGui::Checkbox(TR("3D-Auswahlboxen anzeigen###chkBox", "Show 3D Wireframe Boxes###chkBox"), &g_cfg.showBlueBoxes);
+                        ImGui::TreePop();
+                    }
+                }
+
+                // =============================================================
+                // 2. SELECTION
+                // =============================================================
+                if (ImGui::CollapsingHeader(TR("Auswahl###HdrSelection", "Selection###HdrSelection"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextDisabled("%s", TR("Bewege den Editor-Cursor auf einen Block und dr\xC3\xBC""cke [E] (oder Klick):",
+                        "Point the editor cursor at any block and press [E] (or click below):"));
+                    ImGui::PopTextWrapPos();
+
+                    if (ImGui::Button(TR("Cursor-Block w\xC3\xA4hlen [E]###btnPick", "Pick Block at Cursor [E]###btnPick"), ImVec2(halfW, 26.0f))) ToggleBlockAtCursor();
+                    ImGui::SameLine(0.0f, 8.0f);
+                    if (ImGui::Button(TR("Ganze Strecke w\xC3\xA4hlen###btnAll", "Select Entire Track###btnAll"), ImVec2(halfW, 26.0f))) SelectAllMapBlocks();
+
+                    if (ImGui::Button(TR("Gleiche Y-H\xC3\xB6he###btnSameY", "Same Height (Y)###btnSameY"), ImVec2(halfW, 26.0f))) SelectBlocksOnSameHeightY();
+                    ImGui::SameLine(0.0f, 8.0f);
+                    if (ImGui::Button(TR("Gleicher Blocktyp###btnSameT", "Same Block Type###btnSameT"), ImVec2(halfW, 26.0f))) SelectBlocksOfSameType();
+
+                    if (hasSelection) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.54f, 0.16f, 0.19f, 0.95f));
+                        if (ImGui::Button(TR("Auswahl aufheben (Backspace)###btnDesel", "Deselect All (Backspace)###btnDesel"), ImVec2(availW, 25.0f))) {
+                            ClearSelectionWithRestore();
+                            g_state = ModState::Selecting;
+                            PlayBeepSound(400, 60);
+                        }
+                        ImGui::PopStyleColor();
+                    }
+
+                    if (ImGui::TreeNode(TR("Bereichs-Box & Letzter Block###NodeSelBox", "Area Box & Last Placed###NodeSelBox"))) {
+                        if (ImGui::Button(TR("Letzten gebauten Block w\xC3\xA4hlen###btnLast", "Select Last Placed Block###btnLast"), ImVec2(availW, 25.0f))) SelectLastPlacedBlock();
+
+                        char c1Label[64];
+                        if (g_hasBoxCorner1) sprintf_s(c1Label, "%s (%d,%d,%d)###btnC1", TR("Ecke 1:", "Corner 1:"), g_boxCorner1.x, g_boxCorner1.y, g_boxCorner1.z);
+                        else sprintf_s(c1Label, "%s###btnC1", TR("1. Box-Ecke 1 setzen", "1. Set Box Corner 1"));
+                        if (ImGui::Button(c1Label, ImVec2(halfW, 25.0f))) SetBoxCorner1AtCursor();
+                        ImGui::SameLine(0.0f, 8.0f);
+                        if (ImGui::Button(TR("2. Box bis Cursor###btnC2", "2. Select Box to Cursor###btnC2"), ImVec2(halfW, 25.0f))) SelectBlocksInBoxToCursor();
+
+                        ImGui::SetNextItemWidth(availW - 118.0f);
+                        if (ImGui::InputInt3("##TargetCurXYZ", &g_lastWorldCursorPos.x)) {
+                            g_lastWorldCursorPos.x = ClampI32(g_lastWorldCursorPos.x, 0, UNLIMITER_MAX);
+                            g_lastWorldCursorPos.y = ClampI32(g_lastWorldCursorPos.y, 1, UNLIMITER_MAX);
+                            g_lastWorldCursorPos.z = ClampI32(g_lastWorldCursorPos.z, 0, UNLIMITER_MAX);
+                            WriteCursorCoord(g_lastWorldCursorPos);
+                        }
+                        ImGui::SameLine(0.0f, 8.0f);
+                        if (ImGui::Button(TR("Auf Auswahl###btnToSel", "To Selection###btnToSel"), ImVec2(-1.0f, 0.0f)) && hasSelection) {
+                            g_lastWorldCursorPos = ReadBlockCoord(g_selectedBlocks[0].blockAddr);
+                            WriteCursorCoord(g_lastWorldCursorPos);
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+
+                // =============================================================
+                // 3. BLUEPRINTS (.tmgroup)
+                // =============================================================
+                if (ImGui::CollapsingHeader(TR("Blaupausen###HdrBlueprints", "Blueprints###HdrBlueprints"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                    float saveBtnW = 92.0f;
+                    ImGui::SetNextItemWidth(availW - saveBtnW - 8.0f);
+                    ImGui::InputTextWithHint("##BpNameInput", TR("Blueprint-Name...", "Blueprint name..."), g_bpNameBuf, sizeof(g_bpNameBuf));
+                    ImGui::SameLine(0.0f, 8.0f);
+                    if (ImGui::Button(TR("Speichern###bpSave", "Save###bpSave"), ImVec2(saveBtnW, 0.0f))) {
+                        if (hasSelection) {
+                            CopySelectedBlocks();
+                            SaveBlueprintToFile(g_bpNameBuf);
+                        }
+                        else {
+                            PlayBeepSound(240, 80);
+                        }
+                    }
+
+                    ImGuiWindowFlags bpChildFlags = (g_blueprintFiles.size() <= 4) ? ImGuiWindowFlags_NoScrollWithMouse : 0;
+                    ImGui::BeginChild("BpFilesScroll", ImVec2(0.0f, 100.0f), ImGuiChildFlags_Borders, bpChildFlags);
                     if (g_blueprintFiles.empty()) {
-                        ImGui::TextDisabled(TR("Noch keine .tmgroup Dateien im Ordner Blueprints\\ gefunden.",
+                        ImGui::PushTextWrapPos(0.0f);
+                        ImGui::TextDisabled("%s", TR("Keine .tmgroup Dateien im Ordner Blueprints\\ gefunden.",
                             "No .tmgroup files found in Blueprints\\ folder yet."));
+                        ImGui::PopTextWrapPos();
                     }
                     else {
                         for (size_t i = 0; i < g_blueprintFiles.size(); ++i) {
                             const std::string& fn = g_blueprintFiles[i];
                             bool isCurrent = (_stricmp(fn.c_str(), g_bpNameBuf) == 0);
-                            if (ImGui::Selectable((fn + ".tmgroup##bp_" + std::to_string(i)).c_str(), isCurrent, ImGuiSelectableFlags_AllowDoubleClick)) {
+                            if (ImGui::Selectable((fn + ".tmgroup##bp_" + std::to_string(i)).c_str(),
+                                isCurrent, ImGuiSelectableFlags_AllowDoubleClick)) {
                                 strncpy_s(g_bpNameBuf, fn.c_str(), sizeof(g_bpNameBuf) - 1);
                                 LoadBlueprintFromFile(g_bpNameBuf);
                                 if (ImGui::IsMouseDoubleClicked(0)) PasteFormationToSelection();
@@ -2774,156 +3820,158 @@ static void RenderDearImGuiFrame(IDirect3DDevice9* pDevice) {
                         }
                     }
                     ImGui::EndChild();
-                    ImGui::TextDisabled(TR("Tipp: Klick lädt die Datei, Doppelklick spawnt sie direkt am Ziel-Cursor!",
-                        "Tip: Single-click loads file, double-click spawns it right at the target cursor!"));
-                    ImGui::EndTabItem();
+
+                    float refreshBtnW = 92.0f;
+                    char pasteLbl[64];
+                    sprintf_s(pasteLbl, "%s (%zu)###bpPaste", TR("Paste am Cursor (I)", "Paste at Cursor (I)"), g_clipboard.size());
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.46f, 0.64f, 1.0f));
+                    if (ImGui::Button(pasteLbl, ImVec2(availW - refreshBtnW - 8.0f, 26.0f))) {
+                        PasteFormationToSelection();
+                    }
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine(0.0f, 8.0f);
+                    if (ImGui::Button(TR("Scannen###bpScan", "Refresh###bpScan"), ImVec2(refreshBtnW, 26.0f))) {
+                        RefreshBlueprintFileList();
+                    }
+
+                    if (ImGui::TreeNode(TR("Blueprint-Optionen###NodeBpOpt", "Blueprint Options###NodeBpOpt"))) {
+                        ImGui::Checkbox(TR("Horizontal (X/Z) am Cursor zentrieren###chkCtr", "Center Horizontally (X/Z) at Cursor###chkCtr"), &g_centerBlueprintAtCursor);
+                        ImGui::TreePop();
+                    }
                 }
 
-                if (ImGui::BeginTabItem(TR("3. Streckenblöcke-Liste", "3. Track Blocks List"))) {
-                    ImGui::Checkbox(TR("Stadion-Außenring ausblenden", "Hide Stadium Perimeter"), &g_cfg.onlyPlayerBlocks);
-                    ImGui::SameLine(360.0f);
-                    if (ImGui::Button(TR("Auswahl leeren", "Clear Selection"), ImVec2(-1.0f, 0.0f))) {
-                        ClearSelectionWithRestore();
-                        g_state = ModState::Selecting;
-                    }
-                    ImGui::BeginChild("BlockListChildTab", ImVec2(0, 330.0f), ImGuiChildFlags_Borders);
-                    if (inEditor && g_ctx.pBlocksArray && g_ctx.blockCount > 0) {
-                        const char* dirNames[4] = { "N(0)", "E(1)", "S(2)", "W(3)" };
-                        int shown = 0;
-                        for (int32_t i = static_cast<int32_t>(g_ctx.blockCount) - 1; i >= 0 && shown < 300; --i) {
-                            uint32_t b = 0;
-                            if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) || !IsMovableTrackBlock(b)) continue;
-                            Int3 pos = ReadBlockCoord(b);
-                            uint32_t dir = ReadBlockDir(b);
-                            bool sel = IsBlockSelected(b);
-                            char rowBuf[192];
-                            sprintf_s(rowBuf, "%s#%d  |  Pos: (%d, %d, %d)  |  Dir: %s  |  [0x%08X]##blk_%u",
-                                sel ? "[*] " : "    ", i, pos.x, pos.y, pos.z, dirNames[dir & 3u], b, b);
-                            if (ImGui::Selectable(rowBuf, sel)) {
-                                if (sel) {
-                                    for (size_t k = 0; k < g_selectedBlocks.size(); ++k) {
-                                        if (g_selectedBlocks[k].blockAddr == b) {
-                                            RemovePulseFromEntry(g_selectedBlocks[k]);
-                                            g_selectedBlocks.erase(g_selectedBlocks.begin() + k);
-                                            break;
-                                        }
-                                    }
-                                }
-                                else {
-                                    g_selectedBlocks.push_back({ b, 0.0f });
-                                    g_state = ModState::Moving;
-                                    if (g_cfg.cursorFollowsMove) {
-                                        WriteCursorCoord(pos);
-                                        g_lastWorldCursorPos = pos;
-                                    }
-                                    ApplyAllSelectionPulses();
-                                }
-                                RequestLiveEditorRebuild();
-                            }
-                            ++shown;
-                        }
-                    }
-                    ImGui::EndChild();
-                    ImGui::EndTabItem();
-                }
-
-                if (ImGui::BeginTabItem(TR("4. Einstellungen & Hotkeys", "4. Settings & Hotkeys"))) {
-                    if (ImGui::Checkbox(TR("Mod Aktiviert (Master-Switch)", "Mod Enabled (Master Switch)"), &g_cfg.modEnabled)) {
-                        if (!g_cfg.modEnabled) RemoveAllSelectionPulses();
-                        RequestLiveEditorRebuild();
-                    }
-                    ImGui::SameLine(295.0f);
-                    ImGui::Checkbox(TR("Sound-Feedback (Beep)", "Sound Feedback (Beep)"), &g_cfg.soundFeedback);
-
+                // =============================================================
+                // 4. HOTKEYS & ADVANCED
+                // =============================================================
+                if (ImGui::CollapsingHeader(TR("Hotkeys & Erweitert###HdrAdvanced", "Hotkeys & Advanced###HdrAdvanced"))) {
                     bool unlimiterMode = (g_cfg.ruleMode == static_cast<int>(BuildRuleMode::TMUnlimiter));
-                    if (ImGui::Checkbox(TR("TMUnlimiter-Baugröße (0 - 255)", "TMUnlimiter Build Size (0 - 255)"), &unlimiterMode)) {
+                    if (ImGui::Checkbox(TR("TMUnlimiter-Raster (0 - 255)###chkUnl", "TMUnlimiter Grid (0 - 255)###chkUnl"), &unlimiterMode)) {
                         g_cfg.ruleMode = unlimiterMode ? 1 : 0;
                     }
-                    ImGui::SameLine(295.0f);
-                    ImGui::Checkbox(TR("Kamerarelative Bewegung", "Camera-Relative Move"), &g_cfg.cameraRelativeMove);
+                    ImGui::Checkbox(TR("Sound-Feedback (Beep)###chkSnd", "Sound Feedback (Beep)###chkSnd"), &g_cfg.soundFeedback);
 
-                    ImGui::Separator();
-                    float availW = ImGui::GetContentRegionAvail().x;
-                    float halfW = (availW - 8.0f) * 0.5f;
-                    if (ImGui::Button(TR("Preset 1: Standard (WASD/V + E/Q/R/L/I)", "Preset 1: Default (WASD/V + E/Q/R/L/I)"), ImVec2(halfW, 24.0f))) {
-                        ApplyKeybindPreset(0);
-                        SaveConfig();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Preset 2: Numpad + F", "Preset 2: Numpad + F"), ImVec2(halfW, 24.0f))) {
-                        ApplyKeybindPreset(1);
-                        SaveConfig();
-                    }
+                    if (ImGui::TreeNode(TR("Tastenbelegung anpassen###NodeKb", "Customize Keybinds###NodeKb"))) {
+                        if (ImGui::Button("Preset: WASD###pr0", ImVec2(halfW, 24.0f))) { ApplyKeybindPreset(0); SaveConfig(); }
+                        ImGui::SameLine(0.0f, 8.0f);
+                        if (ImGui::Button("Preset: Numpad###pr1", ImVec2(halfW, 24.0f))) { ApplyKeybindPreset(1); SaveConfig(); }
 
-                    ImGui::TextColored(ImVec4(0.00f, 0.88f, 1.00f, 1.0f),
-                        TR("Alle Hotkeys (Klick = Ändern | ENTF = Taste löschen | ESC = Abbruch):",
-                            "All Hotkeys (Click = Bind | DEL = Clear keybind | ESC = Cancel):"));
+                        struct ShortKbItem { const char* nameDe; const char* nameEn; int* ptr; };
+                        ShortKbItem kbItems[22] = {
+                            { "GUI Men\xC3\xBC:",          "GUI Menu:",         &g_cfg.keyToggleMenu },
+                            { "Mod Ein/Aus:",             "Mod On/Off:",       &g_cfg.keyToggleModMode },
+                            { "Block ausw\xC3\xA4hlen:",  "Select Block:",     &g_cfg.keySelectBlock },
+                            { "Auswahl absetzen:",        "Deselect All:",     &g_cfg.keyConfirmSelection },
+                            { "Vorw\xC3\xA4rts:",         "Move Forward:",     &g_cfg.keyMoveNorth },
+                            { "R\xC3\xBC""ckw\xC3\xA4rts:", "Move Back:",      &g_cfg.keyMoveSouth },
+                            { "Links:",                   "Move Left:",        &g_cfg.keyMoveWest },
+                            { "Rechts:",                  "Move Right:",       &g_cfg.keyMoveEast },
+                            { "Hoch (+Y):",               "Move Up (+Y):",     &g_cfg.keyMoveUp },
+                            { "Runter (-Y):",             "Move Down (-Y):",   &g_cfg.keyMoveDown },
+                            { "90\xC2\xB0 Rechts:",       "Rotate 90\xC2\xB0 CW:",  &g_cfg.keyRotateCW },
+                            { "90\xC2\xB0 Links:",        "Rotate 90\xC2\xB0 CCW:", &g_cfg.keyRotateCCW },
+                            { "Zum Cursor!:",             "Teleport Cursor:",  &g_cfg.keyTeleportToCursor },
+                            { "Am Cursor klonen:",        "Clone at Cursor:",  &g_cfg.keyCloneAtCursor },
+                            { "Letzter Block:",           "Last Placed Blk:",  &g_cfg.keySelectLastBuilt },
+                            { "Alle Bl\xC3\xB6""cke:",    "All Map Blocks:",   &g_cfg.keySelectAllBlocks },
+                            { "Gleiche Y-H\xC3\xB6he:",   "Same Y-Height:",    &g_cfg.keySelectSameHeight },
+                            { "Gleicher Blocktyp:",       "Same Block Type:",  &g_cfg.keySelectSameType },
+                            { "Box-Ecke 1 setzen:",       "Set Box Corner 1:", &g_cfg.keyBoxCorner1 },
+                            { "Box-Bereich w\xC3\xA4hlen:", "Select Box Area:", &g_cfg.keyBoxSelect2 },
+                            { "Schrittweite (1-16):",     "Cycle Step Size:",  &g_cfg.keyStepSizeCycle },
+                            { "Spawnen (Paste):",         "Spawn Blueprint:",  &g_cfg.keyPasteBlueprint }
+                        };
 
-                    struct ShortKbItem { const char* nameDe; const char* nameEn; int* ptr; };
-                    ShortKbItem kbItems[22] = {
-                        { "GUI Menü:",          "GUI Menu:",          &g_cfg.keyToggleMenu },
-                        { "Mod Ein/Aus:",       "Mod On/Off:",        &g_cfg.keyToggleModMode },
-                        { "Block auswählen:",   "Select Block:",      &g_cfg.keySelectBlock },
-                        { "Auswahl absetzen:",  "Deselect All:",      &g_cfg.keyConfirmSelection },
-                        { "Vorwärts:",          "Move Forward:",      &g_cfg.keyMoveNorth },
-                        { "Rückwärts:",         "Move Back:",         &g_cfg.keyMoveSouth },
-                        { "Links:",             "Move Left:",         &g_cfg.keyMoveWest },
-                        { "Rechts:",            "Move Right:",        &g_cfg.keyMoveEast },
-                        { "Hoch (+Y):",         "Move Up (+Y):",      &g_cfg.keyMoveUp },
-                        { "Runter (-Y):",       "Move Down (-Y):",    &g_cfg.keyMoveDown },
-                        { "90° Rechts drehen:", "Rotate 90° CW:",     &g_cfg.keyRotateCW },
-                        { "90° Links drehen:",  "Rotate 90° CCW:",    &g_cfg.keyRotateCCW },
-                        { "Zum Cursor!:",       "Teleport Cursor:",   &g_cfg.keyTeleportToCursor },
-                        { "Am Cursor klonen:",  "Clone at Cursor:",   &g_cfg.keyCloneAtCursor },
-                        { "Letzter Block:",     "Last Placed Blk:",   &g_cfg.keySelectLastBuilt },
-                        { "Alle Blöcke:",       "All Map Blocks:",    &g_cfg.keySelectAllBlocks },
-                        { "Gleiche Y-Höhe:",    "Same Y-Height:",     &g_cfg.keySelectSameHeight },
-                        { "Gleicher Blocktyp:", "Same Block Type:",   &g_cfg.keySelectSameType },
-                        { "Box-Ecke 1 setzen:", "Set Box Corner 1:",  &g_cfg.keyBoxCorner1 },
-                        { "Box-Bereich wählen:","Select Box Area:",   &g_cfg.keyBoxSelect2 },
-                        { "Schrittweite (1-16):","Cycle Step Size:",  &g_cfg.keyStepSizeCycle },
-                        { "Spawnen (Paste):",   "Spawn Blueprint:",   &g_cfg.keyPasteBlueprint }
-                    };
-
-                    ImGui::BeginChild("KbScrollChild", ImVec2(0, 240.0f), ImGuiChildFlags_Borders);
-                    if (ImGui::BeginTable("KbTable", 2, ImGuiTableFlags_SizingStretchSame)) {
+                        ImGui::BeginChild("KbCompactScroll", ImVec2(0.0f, 175.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                         for (int i = 0; i < 22; ++i) {
-                            ImGui::TableNextColumn();
                             ImGui::Text("%s", TR(kbItems[i].nameDe, kbItems[i].nameEn));
-                            ImGui::SameLine(132.0f);
+                            ImGui::SameLine(185.0f);
                             bool isBindingThis = (g_bindingTarget == kbItems[i].ptr);
-                            std::string btnLbl = (isBindingThis ? TR("Taste drücken...", "Press key...") : ("[ " + GetKeyName(*kbItems[i].ptr) + " ]")) + "##kb" + std::to_string(i);
+                            std::string btnLbl = (isBindingThis ? TR("Taste dr\xC3\xBC""cken...", "Press key...") : ("[ " + GetKeyName(*kbItems[i].ptr) + " ]")) + "###kb" + std::to_string(i);
                             if (ImGui::Button(btnLbl.c_str(), ImVec2(-1.0f, 22.0f))) {
                                 g_bindingTarget = kbItems[i].ptr;
                             }
                         }
-                        ImGui::EndTable();
+                        ImGui::EndChild();
+                        ImGui::TreePop();
                     }
-                    ImGui::EndChild();
 
-                    if (ImGui::Button(TR("Einstellungen speichern (.ini)", "Save Settings (.ini)"), ImVec2(halfW, 28.0f))) {
+                    if (ImGui::TreeNode(TR("Streckenbl\xC3\xB6""cke-Liste###NodeBlkList", "Track Blocks List###NodeBlkList"))) {
+                        ImGui::Checkbox(TR("Stadion-Au\xC3\x9F""enring ausblenden###chkPerim", "Hide Stadium Perimeter###chkPerim"), &g_cfg.onlyPlayerBlocks);
+                        ImGui::BeginChild("AdvBlockList", ImVec2(0.0f, 160.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                        if (g_ctx.pBlocksArray && g_ctx.blockCount > 0) {
+                            const char* dirNames[4] = { "N", "E", "S", "W" };
+                            int shown = 0;
+                            for (int32_t i = static_cast<int32_t>(g_ctx.blockCount) - 1; i >= 0 && shown < 250; --i) {
+                                uint32_t b = 0;
+                                if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) || !IsMovableTrackBlock(b)) continue;
+                                Int3 pos = ReadBlockCoord(b);
+                                uint32_t dir = ReadBlockDir(b);
+                                bool sel = IsBlockSelected(b);
+                                char rowBuf[128];
+                                sprintf_s(rowBuf, "%s#%d  |  (%d, %d, %d)  |  %s##blk_%u",
+                                    sel ? "[*] " : "    ", i, pos.x, pos.y, pos.z, dirNames[dir & 3u], b);
+                                if (ImGui::Selectable(rowBuf, sel)) {
+                                    g_useSingleBoundingBox = false;
+                                    if (sel) {
+                                        for (size_t k = 0; k < g_selectedBlocks.size(); ++k) {
+                                            if (g_selectedBlocks[k].blockAddr == b) {
+                                                RemovePulseFromEntry(g_selectedBlocks[k]);
+                                                g_selectedBlocks.erase(g_selectedBlocks.begin() + k);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    else {
+                                        g_selectedBlocks.push_back({ b, 0.0f });
+                                        g_state = ModState::Moving;
+                                        if (g_cfg.cursorFollowsMove) {
+                                            WriteCursorCoord(pos);
+                                            g_lastWorldCursorPos = pos;
+                                        }
+                                        ApplyAllSelectionPulses();
+                                    }
+                                    RequestLiveEditorRebuild();
+                                }
+                                ++shown;
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::TreePop();
+                    }
+
+                    if (ImGui::Button(TR("Einstellungen speichern (.ini)###btnIni", "Save Settings (.ini)###btnIni"), ImVec2(halfW, 25.0f))) {
                         SaveConfig();
                         PlayBeepSound(1200, 80);
                     }
-                    ImGui::SameLine();
-                    if (ImGui::Button(TR("Diagnose speichern (.txt)", "Save Diagnostics (.txt)"), ImVec2(halfW, 28.0f))) {
+                    ImGui::SameLine(0.0f, 8.0f);
+                    if (ImGui::Button(TR("Diagnose speichern (.txt)###btnDiag", "Save Diagnostics (.txt)###btnDiag"), ImVec2(halfW, 25.0f))) {
                         WriteDiagnosticFile();
                     }
-                    ImGui::EndTabItem();
                 }
-                ImGui::EndTabBar();
             }
         }
         ImGui::End();
-        g_menuVisible = open;
-    }
-    else {
-        g_imguiWantKeyboard = false;
-    }
 
-    ImGui::EndFrame();
+        if (!open) {
+            g_menuVisible = false;
+            ClearSelectionWithRestore();
+            g_state = ModState::Selecting;
+        }
+    }
     ImGui::Render();
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+}
+
+// SEH Crash-Catch wrapper around ImGui rendering (prevents crashes on Alt+Tab / DeviceLost)
+static void RenderDearImGuiFrameSeh(IDirect3DDevice9* pDevice) {
+    __try {
+        RenderDearImGuiFrame(pDevice);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_lastRebuildException = GetExceptionCode();
+        g_imguiInitialized = false;
+        g_imguiDevice = nullptr;
+    }
 }
 
 static const HookedD3DVTableEntry* FindHookedVTableEntryForDevice(IDirect3DDevice9* pDevice) {
@@ -2966,11 +4014,28 @@ static HRESULT STDMETHODCALLTYPE HookedSetTransform(IDirect3DDevice9* pDevice, D
 }
 
 static HRESULT STDMETHODCALLTYPE HookedReset(IDirect3DDevice9* pDevice, D3DPRESENT_PARAMETERS* pPresentationParameters) {
-    if (g_imguiInitialized) ImGui_ImplDX9_InvalidateDeviceObjects();
+    g_deviceResetInProgress = true;
+    if (g_imguiInitialized) {
+        __try { ImGui_ImplDX9_InvalidateDeviceObjects(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_imguiInitialized = false; }
+    }
     const HookedD3DVTableEntry* entry = FindHookedVTableEntryForDevice(pDevice);
     HRESULT hr = (entry && entry->origReset) ? entry->origReset(pDevice, pPresentationParameters) : D3D_OK;
-    if (SUCCEEDED(hr) && g_imguiInitialized) ImGui_ImplDX9_CreateDeviceObjects();
+    if (SUCCEEDED(hr) && g_imguiInitialized) {
+        __try { ImGui_ImplDX9_CreateDeviceObjects(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_imguiInitialized = false; }
+    }
+    g_deviceResetInProgress = false;
     return hr;
+}
+
+static HRESULT SafeTestCooperativeLevel(IDirect3DDevice9* pDevice) {
+    __try {
+        return pDevice->TestCooperativeLevel();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return D3DERR_DEVICELOST;
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE HookedEndScene(IDirect3DDevice9* pDevice) {
@@ -2978,16 +4043,22 @@ static HRESULT STDMETHODCALLTYPE HookedEndScene(IDirect3DDevice9* pDevice) {
     const HookedD3DVTableEntry* entry = FindHookedVTableEntryForDevice(pDevice);
     FnD3D9EndScene origEndScene = entry ? entry->origEndScene : nullptr;
 
-    bool inEditor = (g_ctx.pEditorCat != 0 && g_ctx.pChallenge != 0);
-    if (!inEditor && !g_menuVisible) {
-        return origEndScene ? origEndScene(pDevice) : D3D_OK;
-    }
+    if (pDevice && !g_deviceResetInProgress) {
+        if (SafeTestCooperativeLevel(pDevice) == D3D_OK) {
+            bool doRebuild = false;
+            {
+                ScopedStateLock lock;
+                bool inEditor = g_editorOverlayActive && (g_ctx.pEditorCat != 0 && g_ctx.pChallenge != 0 && g_ctx.pCursor != 0);
+                if (inEditor && g_rebuildPending) doRebuild = true;
+            }
+            if (doRebuild) ExecuteEditorSceneRebuildNow();
 
-    if (inEditor && g_rebuildPending) ExecuteEditorSceneRebuildNow();
-
-    if (pDevice) {
-        ScopedStateLock lock;
-        RenderDearImGuiFrame(pDevice);
+            ScopedStateLock lock;
+            bool inEditor = g_editorOverlayActive && (g_ctx.pEditorCat != 0 && g_ctx.pChallenge != 0 && g_ctx.pCursor != 0);
+            if (inEditor) {
+                RenderDearImGuiFrameSeh(pDevice);
+            }
+        }
     }
 
     return origEndScene ? origEndScene(pDevice) : D3D_OK;
@@ -3161,9 +4232,30 @@ static bool WasKeyPressed(int vKey) {
     return pressed;
 }
 
+static bool IsEditorObjectsValid() {
+    return (IsAnyHeapObject(g_ctx.pEditorCat) && IsAnyHeapObject(g_ctx.pCursor) &&
+        IsAnyHeapObject(g_ctx.pChallenge) && g_ctx.pBlocksArray != 0 && g_ctx.blockCount > 0);
+}
+
+static bool IsCursorAttachedToScene() {
+    if (!IsAnyHeapObject(g_ctx.pCursor)) return false;
+    uint32_t curMob = 0, curScene = 0;
+    if (SafeReadU32(g_ctx.pCursor + 0x40, &curMob) && IsAnyHeapObject(curMob)) {
+        return (SafeReadU32(curMob + 0x14, &curScene) && IsAnyHeapObject(curScene));
+    }
+    return false;
+}
+
+static bool IsActivelyInTrackEditor() {
+    if (!IsEditorObjectsValid()) return false;
+    if (g_menuVisible) return true;
+    return IsCursorAttachedToScene();
+}
+
 static void UpdateStatusBanner() {
     static ULONGLONG lastTick = 0;
     static uintptr_t lastChallengePtr = 0;
+    static int       s_detachedTicks = 0;
     ULONGLONG now = GetTickCount64();
     if (now - lastTick < 200) return;
     lastTick = now;
@@ -3173,28 +4265,75 @@ static void UpdateStatusBanner() {
     EnsureGameWindowSubclassed();
     EnsureD3D9OverlayHooked();
 
-    if (!mapOk || g_ctx.pChallenge != lastChallengePtr) {
+    if (!mapOk || !IsEditorObjectsValid()) {
+        g_editorOverlayActive = false;
         g_selectedBlocks.clear();
         g_dirtyBlocks.clear();
         g_clonedSignOverrides.clear();
+        g_hasBoxCorner1 = false;
+        g_lastMovedBlockAddr = 0;
+        g_menuVisible = false;
+        lastChallengePtr = 0;
+        s_detachedTicks = 0;
+        return;
+    }
+
+    // When outside the track editor (normal gameplay / test-drive), the 3D cursor is detached from CScene3d
+    if (!IsCursorAttachedToScene()) {
+        ++s_detachedTicks;
+        if (!g_menuVisible && s_detachedTicks >= 2) {
+            g_editorOverlayActive = false;
+        }
+        if (s_detachedTicks >= 4) {
+            g_editorOverlayActive = false;
+            g_selectedBlocks.clear();
+            g_hasBoxCorner1 = false;
+            g_menuVisible = false;
+        }
+    }
+    else {
+        s_detachedTicks = 0;
+        g_editorOverlayActive = true;
+    }
+
+    if (g_ctx.pChallenge != lastChallengePtr) {
+        g_selectedBlocks.clear();
+        g_dirtyBlocks.clear();
+        g_clonedSignOverrides.clear();
+        g_hasBoxCorner1 = false;
+        g_unitLayout = BlockUnitLayoutInfo{};
         g_lastMovedBlockAddr = 0;
         lastChallengePtr = g_ctx.pChallenge;
+
+        bool hasUnlimiterBlocks = false;
+        for (uint32_t i = 0; i < g_ctx.blockCount; ++i) {
+            uint32_t b = 0;
+            if (!SafeReadU32(g_ctx.pBlocksArray + i * 4, &b) || !IsAnyHeapObject(b)) continue;
+            Int3 pos = ReadBlockCoord(b);
+            if (pos.x > 31 || pos.y > 31 || pos.z > 31) {
+                hasUnlimiterBlocks = true;
+                break;
+            }
+        }
+        g_cfg.ruleMode = hasUnlimiterBlocks
+            ? static_cast<int>(BuildRuleMode::TMUnlimiter)
+            : static_cast<int>(BuildRuleMode::Vanilla);
     }
-    UpdateCursorBoxHighlightColor(!g_selectedBlocks.empty());
 }
 
 // ============================================================================
-// 7. Haupt-Thread & DLL-Einstiegspunkt
+// 7. Main Thread & DLL Entry Point (with SEH Crash Protection)
 // ============================================================================
 
-DWORD WINAPI ModThread(LPVOID lpParam) {
-    InitPaths(reinterpret_cast<HMODULE>(lpParam));
+static void RunModMainLoop(HMODULE hMod) {
+    InitPaths(hMod);
     LoadConfig();
 
     while (g_running) {
         if (g_bindingTarget) {
             for (int vk = 8; vk < 255; ++vk) {
                 if (vk == VK_LBUTTON || vk == VK_RBUTTON) continue;
+                if (vk >= VK_F5 && vk <= VK_F7) continue;
                 if (WasKeyPressed(vk)) {
                     if (vk == VK_DELETE) {
                         *g_bindingTarget = 0;
@@ -3214,7 +4353,11 @@ DWORD WINAPI ModThread(LPVOID lpParam) {
 
         UpdateStatusBanner();
 
-        if (!IsTrackManiaProcessFocused() || IsTypingInBlueprintBox()) {
+        if (g_needVt31Rebuild && g_deferredVt31Tick != 0 && GetTickCount64() >= g_deferredVt31Tick) {
+            g_deferredVt31Tick = 0;
+            RequestLiveEditorRebuild();
+        }
+        if (!IsTrackManiaProcessFocused() || !IsActivelyInTrackEditor() || IsTypingInBlueprintBox()) {
             Sleep(20);
             continue;
         }
@@ -3263,7 +4406,7 @@ DWORD WINAPI ModThread(LPVOID lpParam) {
             if (WasKeyPressed(g_cfg.keySelectSameType))   SelectBlocksOfSameType();
             if (WasKeyPressed(g_cfg.keyBoxCorner1))       SetBoxCorner1AtCursor();
             if (WasKeyPressed(g_cfg.keyBoxSelect2))       SelectBlocksInBoxToCursor();
-            if (WasKeyPressed(g_cfg.keyStepSizeCycle))    CycleStepMultiplier();
+            if (WasKeyPressed(g_cfg.keyStepSizeCycle))    CycleStepMultiplier(false);
 
             if (!g_selectedBlocks.empty()) {
                 if (WasKeyPressed(g_cfg.keyConfirmSelection) || WasKeyPressed(g_cfg.keyBackToSelect)) {
@@ -3297,6 +4440,30 @@ DWORD WINAPI ModThread(LPVOID lpParam) {
         }
 
         Sleep(10);
+    }
+}
+
+static void ResetModStateAfterException(uint32_t exCode) {
+    g_lastRebuildException = exCode;
+    g_selectedBlocks.clear();
+    g_dirtyBlocks.clear();
+    g_hasBoxCorner1 = false;
+    Sleep(250);
+}
+
+static void RunModMainLoopSeh(HMODULE hMod) {
+    __try {
+        RunModMainLoop(hMod);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ResetModStateAfterException(GetExceptionCode());
+    }
+}
+
+DWORD WINAPI ModThread(LPVOID lpParam) {
+    HMODULE hMod = reinterpret_cast<HMODULE>(lpParam);
+    while (g_running) {
+        RunModMainLoopSeh(hMod);
     }
 
     UnhookD3D9Overlay();
